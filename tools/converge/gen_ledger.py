@@ -78,6 +78,57 @@ OVERRIDES = {
         "batch 4). simple_strtoull/simple_strtol, skip_spaces and "
         "strlen/strncmp are called externally, as in C. The C file "
         "still provides the symbols."),
+    "lib/find_bit.c": (
+        "KRELL (functions)",
+        "All 16 functions rewritten in Krell (lib/find_bit.krell): "
+        "the _find_first/_find_next families (plain, and, andnot, "
+        "or, zero variants), __find_nth_bit and its and/andnot "
+        "forms, _find_last_bit, find_next_clump8 and "
+        "find_random_bit, mirroring the C FIND_* macro expansions "
+        "operation for operation, including the unmasked last "
+        "word of the first-bit scan and the nth-bit fall-through; "
+        "differential rig vs the C original: part of the batch 5 "
+        "rig (22,855 cases across the batch, 0 divergence); Krell "
+        "object linked into vmlinux and self-checked at boot "
+        "(Phase 1 batch 5). The _le variants are compiled only "
+        "on big-endian and have no x86_64 instance. The C file "
+        "still provides the symbols."),
+    "lib/bitmap.c": (
+        "KRELL (functions)",
+        "33 of 35 functions rewritten in Krell (lib/bitmap.krell): the "
+        "__bitmap_* core (equal/or_equal/complement, shifts, "
+        "cut, and/or/xor/andnot/replace, intersects/subset, the "
+        "weight family, set/clear), bitmap_find_next_zero_area_off, "
+        "bitmap_remap/bitmap_bitremap/bitmap_onto/bitmap_fold "
+        "(the last two under CONFIG_NUMA, as configured), the "
+        "bitmap_alloc/zalloc family and bitmap_from/to_arr32; "
+        "differential rig vs the C originals: part of the batch 5 "
+        "rig (22,855 cases across the batch, 0 divergence); Krell "
+        "object linked into vmlinux and self-checked at boot "
+        "(Phase 1 batch 5). Residue: devm_bitmap_alloc() and "
+        "devm_bitmap_zalloc() stay C -- they register the "
+        "file-local static devm_bitmap_free() callback whose "
+        "address the Krell form cannot name. "
+        "bitmap_from/to_arr64 are compiled only when "
+        "BITS_PER_LONG == 32 and have no x86_64 instance. The C "
+        "file still provides the symbols."),
+    "lib/bitmap-str.c": (
+        "KRELL (functions)",
+        "All 6 exported functions rewritten in Krell "
+        "(lib/bitmap-str.krell): bitmap_parse and "
+        "bitmap_parse_user, bitmap_parselist and "
+        "bitmap_parselist_user, bitmap_print_bitmask_to_buf and "
+        "bitmap_print_list_to_buf, with the file-local region "
+        "helpers carried as internal functions (the C file's "
+        "struct region is passed as four scalar slots owned by "
+        "bitmap_parselist); differential rig vs the C originals: "
+        "part of the batch 5 rig (22,855 cases across the batch, "
+        "0 divergence), including the kasprintf argument "
+        "contract of the print functions, which the boot "
+        "self-check compares through the real vsprintf path; "
+        "Krell object linked into vmlinux and self-checked at "
+        "boot (Phase 1 batch 5). The C file still provides the "
+        "symbols."),
     "lib/bsearch.c": (
         "KRELL (function)",
         "bsearch() rewritten in Krell (lib/bsearch.krell): the C "

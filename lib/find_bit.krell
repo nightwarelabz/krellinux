@@ -1,0 +1,653 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+; lib/find_bit.c converted to Krell (Phase 1 batch 5).
+;
+; The C file builds its family from three macros
+; (FIND_FIRST_BIT / FIND_NEXT_BIT / FIND_NTH_BIT) instantiated
+; per fetch expression; the Krell form keeps that shape --
+; one loop nest per function with its fetch inlined.  __ffs
+; is ctz, __fls is 63 - clz, hweight_long is popcount, and
+; fns() from linux/bitops.h is klfb_fns.  The little-endian
+; build has no _le variants (they are __BIG_ENDIAN only).
+; find_random_bit calls __bitmap_weight (lib/bitmap.krell)
+; and get_random_u32_below (drivers/char/random.c)
+; externally, as in C.
+
+extern __bitmap_weight(ptr, i32) -> i32
+; get_random_u32_below is a random.h inline in C; for a
+; variable ceil (the weight here) it is exactly
+; __get_random_u32_below (drivers/char/random.c).
+extern __get_random_u32_below(i32) -> i32
+
+; BITMAP_LAST_WORD_MASK(nbits)
+fn klfb_lastmask(i64) -> i64 {
+  entry(n: i64):
+    %m = and i64 n, 63
+    %nz = icmp.ne i64 %m, 0
+    %sh = shl i64 1, %m
+    %mm = sub i64 %sh, 1
+    %all = sub i64 0, 1
+    %r = select i64 %nz, %mm, %all
+    ret %r
+}
+
+; fns(): position of the nth set bit (0-based), 64 if fewer.
+fn klfb_fns(i64, i64) -> i64 {
+  entry(word: i64, n: i64):
+    %nt = trunc i32 n
+    %nz = zext i64 %nt
+    br loop(word, %nz)
+  loop(w: i64, k: i64):
+    %wz = icmp.eq i64 w, 0
+    condbr %wz, done(w), chk(w, k)
+  chk(w: i64, k: i64):
+    %kz = icmp.eq i64 k, 0
+    condbr %kz, done(w), step(w, k)
+  step(w: i64, k: i64):
+    %wm = sub i64 w, 1
+    %w2 = and i64 w, %wm
+    %k2 = sub i64 k, 1
+    br loop(%w2, %k2)
+  done(w: i64):
+    %z = icmp.eq i64 w, 0
+    %f = ctz i64 w
+    %r = select i64 %z, 64, %f
+    ret %r
+}
+
+; bitmap_read(map, start, 8): the value find_next_clump8
+; extracts (bitmap_get_value8 in the C file).
+fn klfb_read8(ptr, i64) -> i64 {
+  entry(map: ptr, start: i64):
+    %idx = udiv i64 start, 64
+    %off = and i64 start, 63
+    %space = sub i64 64, %off
+    %enough = icmp.uge i64 %space, 8
+    condbr %enough, one(map, %idx, %off), two(map, start, %idx, %off, %space)
+  one(map: ptr, idx: i64, off: i64):
+    %p = gep i64 map, idx
+    %w = load i64, %p
+    %v = lshr i64 %w, off
+    %r = and i64 %v, 255
+    ret %r
+  two(map: ptr, start: i64, idx: i64, off: i64, space: i64):
+    %p = gep i64 map, idx
+    %w = load i64, %p
+    %all = sub i64 0, 1
+    %fm = shl i64 %all, off
+    %low = and i64 %w, %fm
+    %s8 = add i64 start, 8
+    %lm = call i64 klfb_lastmask(%s8)
+    %i2 = add i64 idx, 1
+    %p2 = gep i64 map, %i2
+    %w2 = load i64, %p2
+    %high = and i64 %w2, %lm
+    %a = lshr i64 %low, off
+    %b = shl i64 %high, space
+    %r = or i64 %a, %b
+    ret %r
+}
+
+fn _find_first_bit(ptr, i64) -> i64 {
+  entry(addr: ptr, size: i64):
+    br head(addr, size, 0)
+  head(addr: ptr, size: i64, idx: i64):
+    %lim = shl i64 idx, 6
+    %c = icmp.ult i64 %lim, size
+    condbr %c, body(addr, size, idx), done(size)
+  body(addr: ptr, size: i64, idx: i64):
+    %p = gep i64 addr, idx
+    %v = load i64, %p
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, found(size, idx, %v), next(addr, size, idx)
+  next(addr: ptr, size: i64, idx: i64):
+    %i2 = add i64 idx, 1
+    br head(addr, size, %i2)
+  found(size: i64, idx: i64, v: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 v
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, size
+    %r = select i64 %lt, %pos, size
+    ret %r
+  done(size: i64):
+    ret size
+}
+
+fn _find_first_and_bit(ptr, ptr, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, size: i64):
+    br head(a1, a2, size, 0)
+  head(a1: ptr, a2: ptr, size: i64, idx: i64):
+    %lim = shl i64 idx, 6
+    %c = icmp.ult i64 %lim, size
+    condbr %c, body(a1, a2, size, idx), done(size)
+  body(a1: ptr, a2: ptr, size: i64, idx: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %v = and i64 %x, %y
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, found(size, idx, %v), next(a1, a2, size, idx)
+  next(a1: ptr, a2: ptr, size: i64, idx: i64):
+    %i2 = add i64 idx, 1
+    br head(a1, a2, size, %i2)
+  found(size: i64, idx: i64, v: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 v
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, size
+    %r = select i64 %lt, %pos, size
+    ret %r
+  done(size: i64):
+    ret size
+}
+
+fn _find_first_andnot_bit(ptr, ptr, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, size: i64):
+    br head(a1, a2, size, 0)
+  head(a1: ptr, a2: ptr, size: i64, idx: i64):
+    %lim = shl i64 idx, 6
+    %c = icmp.ult i64 %lim, size
+    condbr %c, body(a1, a2, size, idx), done(size)
+  body(a1: ptr, a2: ptr, size: i64, idx: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %v = and i64 %x, %ny
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, found(size, idx, %v), next(a1, a2, size, idx)
+  next(a1: ptr, a2: ptr, size: i64, idx: i64):
+    %i2 = add i64 idx, 1
+    br head(a1, a2, size, %i2)
+  found(size: i64, idx: i64, v: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 v
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, size
+    %r = select i64 %lt, %pos, size
+    ret %r
+  done(size: i64):
+    ret size
+}
+
+fn _find_first_and_and_bit(ptr, ptr, ptr, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, a3: ptr, size: i64):
+    br head(a1, a2, a3, size, 0)
+  head(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64):
+    %lim = shl i64 idx, 6
+    %c = icmp.ult i64 %lim, size
+    condbr %c, body(a1, a2, a3, size, idx), done(size)
+  body(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %p3 = gep i64 a3, idx
+    %z = load i64, %p3
+    %xy = and i64 %x, %y
+    %v = and i64 %xy, %z
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, found(size, idx, %v), next(a1, a2, a3, size, idx)
+  next(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64):
+    %i2 = add i64 idx, 1
+    br head(a1, a2, a3, size, %i2)
+  found(size: i64, idx: i64, v: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 v
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, size
+    %r = select i64 %lt, %pos, size
+    ret %r
+  done(size: i64):
+    ret size
+}
+
+fn _find_first_zero_bit(ptr, i64) -> i64 {
+  entry(addr: ptr, size: i64):
+    br head(addr, size, 0)
+  head(addr: ptr, size: i64, idx: i64):
+    %lim = shl i64 idx, 6
+    %c = icmp.ult i64 %lim, size
+    condbr %c, body(addr, size, idx), done(size)
+  body(addr: ptr, size: i64, idx: i64):
+    %p = gep i64 addr, idx
+    %x = load i64, %p
+    %all = sub i64 0, 1
+    %v = xor i64 %x, %all
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, found(size, idx, %v), next(addr, size, idx)
+  next(addr: ptr, size: i64, idx: i64):
+    %i2 = add i64 idx, 1
+    br head(addr, size, %i2)
+  found(size: i64, idx: i64, v: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 v
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, size
+    %r = select i64 %lt, %pos, size
+    ret %r
+  done(size: i64):
+    ret size
+}
+
+fn _find_next_bit(ptr, i64, i64) -> i64 {
+  entry(addr: ptr, nbits: i64, start: i64):
+    %ge = icmp.uge i64 start, nbits
+    condbr %ge, out(nbits), go(addr, nbits, start)
+  go(addr: ptr, nbits: i64, start: i64):
+    %m6 = and i64 start, 63
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    %idx = udiv i64 start, 64
+    %p = gep i64 addr, %idx
+    %x = load i64, %p
+    %tmp = and i64 %x, %mask
+    br chk(addr, nbits, %idx, %tmp)
+  chk(addr: ptr, nbits: i64, idx: i64, tmp: i64):
+    %z = icmp.eq i64 tmp, 0
+    condbr %z, step(addr, nbits, idx), found(nbits, idx, tmp)
+  step(addr: ptr, nbits: i64, idx: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %ge2 = icmp.uge i64 %lim, nbits
+    condbr %ge2, out(nbits), fetch(addr, nbits, %ni)
+  fetch(addr: ptr, nbits: i64, idx: i64):
+    %p = gep i64 addr, idx
+    %tmp = load i64, %p
+    br chk(addr, nbits, idx, %tmp)
+  found(nbits: i64, idx: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 tmp
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, nbits
+    %r = select i64 %lt, %pos, nbits
+    ret %r
+  out(nbits: i64):
+    ret nbits
+}
+
+fn _find_next_and_bit(ptr, ptr, i64, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, nbits: i64, start: i64):
+    %ge = icmp.uge i64 start, nbits
+    condbr %ge, out(nbits), go(a1, a2, nbits, start)
+  go(a1: ptr, a2: ptr, nbits: i64, start: i64):
+    %m6 = and i64 start, 63
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    %idx = udiv i64 start, 64
+    %p1 = gep i64 a1, %idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, %idx
+    %y = load i64, %p2
+    %xy = and i64 %x, %y
+    %tmp = and i64 %xy, %mask
+    br chk(a1, a2, nbits, %idx, %tmp)
+  chk(a1: ptr, a2: ptr, nbits: i64, idx: i64, tmp: i64):
+    %z = icmp.eq i64 tmp, 0
+    condbr %z, step(a1, a2, nbits, idx), found(nbits, idx, tmp)
+  step(a1: ptr, a2: ptr, nbits: i64, idx: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %ge2 = icmp.uge i64 %lim, nbits
+    condbr %ge2, out(nbits), fetch(a1, a2, nbits, %ni)
+  fetch(a1: ptr, a2: ptr, nbits: i64, idx: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %tmp = and i64 %x, %y
+    br chk(a1, a2, nbits, idx, %tmp)
+  found(nbits: i64, idx: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 tmp
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, nbits
+    %r = select i64 %lt, %pos, nbits
+    ret %r
+  out(nbits: i64):
+    ret nbits
+}
+
+fn _find_next_andnot_bit(ptr, ptr, i64, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, nbits: i64, start: i64):
+    %ge = icmp.uge i64 start, nbits
+    condbr %ge, out(nbits), go(a1, a2, nbits, start)
+  go(a1: ptr, a2: ptr, nbits: i64, start: i64):
+    %m6 = and i64 start, 63
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    %idx = udiv i64 start, 64
+    %p1 = gep i64 a1, %idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, %idx
+    %y = load i64, %p2
+    %ny = xor i64 %y, %all
+    %xy = and i64 %x, %ny
+    %tmp = and i64 %xy, %mask
+    br chk(a1, a2, nbits, %idx, %tmp)
+  chk(a1: ptr, a2: ptr, nbits: i64, idx: i64, tmp: i64):
+    %z = icmp.eq i64 tmp, 0
+    condbr %z, step(a1, a2, nbits, idx), found(nbits, idx, tmp)
+  step(a1: ptr, a2: ptr, nbits: i64, idx: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %ge2 = icmp.uge i64 %lim, nbits
+    condbr %ge2, out(nbits), fetch(a1, a2, nbits, %ni)
+  fetch(a1: ptr, a2: ptr, nbits: i64, idx: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %all2 = sub i64 0, 1
+    %ny = xor i64 %y, %all2
+    %tmp = and i64 %x, %ny
+    br chk(a1, a2, nbits, idx, %tmp)
+  found(nbits: i64, idx: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 tmp
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, nbits
+    %r = select i64 %lt, %pos, nbits
+    ret %r
+  out(nbits: i64):
+    ret nbits
+}
+
+fn _find_next_or_bit(ptr, ptr, i64, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, nbits: i64, start: i64):
+    %ge = icmp.uge i64 start, nbits
+    condbr %ge, out(nbits), go(a1, a2, nbits, start)
+  go(a1: ptr, a2: ptr, nbits: i64, start: i64):
+    %m6 = and i64 start, 63
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    %idx = udiv i64 start, 64
+    %p1 = gep i64 a1, %idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, %idx
+    %y = load i64, %p2
+    %xy = or i64 %x, %y
+    %tmp = and i64 %xy, %mask
+    br chk(a1, a2, nbits, %idx, %tmp)
+  chk(a1: ptr, a2: ptr, nbits: i64, idx: i64, tmp: i64):
+    %z = icmp.eq i64 tmp, 0
+    condbr %z, step(a1, a2, nbits, idx), found(nbits, idx, tmp)
+  step(a1: ptr, a2: ptr, nbits: i64, idx: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %ge2 = icmp.uge i64 %lim, nbits
+    condbr %ge2, out(nbits), fetch(a1, a2, nbits, %ni)
+  fetch(a1: ptr, a2: ptr, nbits: i64, idx: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %tmp = or i64 %x, %y
+    br chk(a1, a2, nbits, idx, %tmp)
+  found(nbits: i64, idx: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 tmp
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, nbits
+    %r = select i64 %lt, %pos, nbits
+    ret %r
+  out(nbits: i64):
+    ret nbits
+}
+
+fn _find_next_zero_bit(ptr, i64, i64) -> i64 {
+  entry(addr: ptr, nbits: i64, start: i64):
+    %ge = icmp.uge i64 start, nbits
+    condbr %ge, out(nbits), go(addr, nbits, start)
+  go(addr: ptr, nbits: i64, start: i64):
+    %m6 = and i64 start, 63
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    %idx = udiv i64 start, 64
+    %p = gep i64 addr, %idx
+    %x = load i64, %p
+    %nx = xor i64 %x, %all
+    %tmp = and i64 %nx, %mask
+    br chk(addr, nbits, %idx, %tmp)
+  chk(addr: ptr, nbits: i64, idx: i64, tmp: i64):
+    %z = icmp.eq i64 tmp, 0
+    condbr %z, step(addr, nbits, idx), found(nbits, idx, tmp)
+  step(addr: ptr, nbits: i64, idx: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %ge2 = icmp.uge i64 %lim, nbits
+    condbr %ge2, out(nbits), fetch(addr, nbits, %ni)
+  fetch(addr: ptr, nbits: i64, idx: i64):
+    %p = gep i64 addr, idx
+    %x = load i64, %p
+    %all2 = sub i64 0, 1
+    %tmp = xor i64 %x, %all2
+    br chk(addr, nbits, idx, %tmp)
+  found(nbits: i64, idx: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %f = ctz i64 tmp
+    %pos = add i64 %base, %f
+    %lt = icmp.ult i64 %pos, nbits
+    %r = select i64 %lt, %pos, nbits
+    ret %r
+  out(nbits: i64):
+    ret nbits
+}
+
+fn __find_nth_bit(ptr, i64, i64) -> i64 {
+  entry(addr: ptr, size: i64, n: i64):
+    br head(addr, size, 0, n, 0)
+  head(addr: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %le = icmp.ule i64 %lim, size
+    condbr %le, body(addr, size, idx, nr, tmp), tail(addr, size, idx, nr, tmp)
+  body(addr: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %reach = add i64 %base, nr
+    %ge = icmp.uge i64 %reach, size
+    condbr %ge, out(size), fetch(addr, size, idx, nr)
+  fetch(addr: ptr, size: i64, idx: i64, nr: i64):
+    %p = gep i64 addr, idx
+    %t = load i64, %p
+    %w = popcount i64 %t
+    %gt = icmp.ugt i64 %w, nr
+    condbr %gt, found(idx, %t, nr), adv(addr, size, idx, nr, %t, %w)
+  adv(addr: ptr, size: i64, idx: i64, nr: i64, t: i64, w: i64):
+    %nr2 = sub i64 nr, w
+    %i2 = add i64 idx, 1
+    br head(addr, size, %i2, %nr2, t)
+  tail(addr: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %m6 = and i64 size, 63
+    %nz = icmp.ne i64 %m6, 0
+    condbr %nz, partial(addr, size, idx, nr), found(idx, tmp, nr)
+  partial(addr: ptr, size: i64, idx: i64, nr: i64):
+    %p = gep i64 addr, idx
+    %t = load i64, %p
+    %lm = call i64 klfb_lastmask(size)
+    %t2 = and i64 %t, %lm
+    br found(idx, %t2, nr)
+  found(idx: i64, t: i64, nr: i64):
+    %f = call i64 klfb_fns(t, nr)
+    %base = shl i64 idx, 6
+    %r = add i64 %base, %f
+    ret %r
+  out(size: i64):
+    ret size
+}
+
+fn __find_nth_and_bit(ptr, ptr, i64, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, size: i64, n: i64):
+    br head(a1, a2, size, 0, n, 0)
+  head(a1: ptr, a2: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %le = icmp.ule i64 %lim, size
+    condbr %le, body(a1, a2, size, idx, nr, tmp), tail(a1, a2, size, idx, nr, tmp)
+  body(a1: ptr, a2: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %reach = add i64 %base, nr
+    %ge = icmp.uge i64 %reach, size
+    condbr %ge, out(size), fetch(a1, a2, size, idx, nr)
+  fetch(a1: ptr, a2: ptr, size: i64, idx: i64, nr: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %t = and i64 %x, %y
+    %w = popcount i64 %t
+    %gt = icmp.ugt i64 %w, nr
+    condbr %gt, found(idx, %t, nr), adv(a1, a2, size, idx, nr, %t, %w)
+  adv(a1: ptr, a2: ptr, size: i64, idx: i64, nr: i64, t: i64, w: i64):
+    %nr2 = sub i64 nr, w
+    %i2 = add i64 idx, 1
+    br head(a1, a2, size, %i2, %nr2, t)
+  tail(a1: ptr, a2: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %m6 = and i64 size, 63
+    %nz = icmp.ne i64 %m6, 0
+    condbr %nz, partial(a1, a2, size, idx, nr), found(idx, tmp, nr)
+  partial(a1: ptr, a2: ptr, size: i64, idx: i64, nr: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %t = and i64 %x, %y
+    %lm = call i64 klfb_lastmask(size)
+    %t2 = and i64 %t, %lm
+    br found(idx, %t2, nr)
+  found(idx: i64, t: i64, nr: i64):
+    %f = call i64 klfb_fns(t, nr)
+    %base = shl i64 idx, 6
+    %r = add i64 %base, %f
+    ret %r
+  out(size: i64):
+    ret size
+}
+
+fn __find_nth_and_andnot_bit(ptr, ptr, ptr, i64, i64) -> i64 {
+  entry(a1: ptr, a2: ptr, a3: ptr, size: i64, n: i64):
+    br head(a1, a2, a3, size, 0, n, 0)
+  head(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %ni = add i64 idx, 1
+    %lim = shl i64 %ni, 6
+    %le = icmp.ule i64 %lim, size
+    condbr %le, body(a1, a2, a3, size, idx, nr, tmp), tail(a1, a2, a3, size, idx, nr, tmp)
+  body(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %base = shl i64 idx, 6
+    %reach = add i64 %base, nr
+    %ge = icmp.uge i64 %reach, size
+    condbr %ge, out(size), fetch(a1, a2, a3, size, idx, nr)
+  fetch(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64, nr: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %p3 = gep i64 a3, idx
+    %z = load i64, %p3
+    %all = sub i64 0, 1
+    %nz2 = xor i64 %z, %all
+    %xy = and i64 %x, %y
+    %t = and i64 %xy, %nz2
+    %w = popcount i64 %t
+    %gt = icmp.ugt i64 %w, nr
+    condbr %gt, found(idx, %t, nr), adv(a1, a2, a3, size, idx, nr, %t, %w)
+  adv(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64, nr: i64, t: i64, w: i64):
+    %nr2 = sub i64 nr, w
+    %i2 = add i64 idx, 1
+    br head(a1, a2, a3, size, %i2, %nr2, t)
+  tail(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64, nr: i64, tmp: i64):
+    %m6 = and i64 size, 63
+    %nz = icmp.ne i64 %m6, 0
+    condbr %nz, partial(a1, a2, a3, size, idx, nr), found(idx, tmp, nr)
+  partial(a1: ptr, a2: ptr, a3: ptr, size: i64, idx: i64, nr: i64):
+    %p1 = gep i64 a1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 a2, idx
+    %y = load i64, %p2
+    %p3 = gep i64 a3, idx
+    %z = load i64, %p3
+    %all = sub i64 0, 1
+    %nz3 = xor i64 %z, %all
+    %xy = and i64 %x, %y
+    %t = and i64 %xy, %nz3
+    %lm = call i64 klfb_lastmask(size)
+    %t2 = and i64 %t, %lm
+    br found(idx, %t2, nr)
+  found(idx: i64, t: i64, nr: i64):
+    %f = call i64 klfb_fns(t, nr)
+    %base = shl i64 idx, 6
+    %r = add i64 %base, %f
+    ret %r
+  out(size: i64):
+    ret size
+}
+
+fn _find_last_bit(ptr, i64) -> i64 {
+  entry(addr: ptr, size: i64):
+    %z = icmp.eq i64 size, 0
+    condbr %z, retz(size), go(addr, size)
+  go(addr: ptr, size: i64):
+    %lm = call i64 klfb_lastmask(size)
+    %sm1 = sub i64 size, 1
+    %idx = udiv i64 %sm1, 64
+    br loop(addr, size, %idx, %lm)
+  loop(addr: ptr, size: i64, idx: i64, val: i64):
+    %p = gep i64 addr, idx
+    %w = load i64, %p
+    %v = and i64 val, %w
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, found(idx, %v), next(addr, size, idx)
+  found(idx: i64, v: i64):
+    %c = clz i64 v
+    %fl = sub i64 63, %c
+    %base = shl i64 idx, 6
+    %r = add i64 %base, %fl
+    ret %r
+  next(addr: ptr, size: i64, idx: i64):
+    %z2 = icmp.eq i64 idx, 0
+    condbr %z2, retz(size), dec(addr, size, idx)
+  dec(addr: ptr, size: i64, idx: i64):
+    %i2 = sub i64 idx, 1
+    %all = sub i64 0, 1
+    br loop(addr, size, %i2, %all)
+  retz(size: i64):
+    ret size
+}
+
+fn find_next_clump8(ptr, ptr, i64, i64) -> i64 {
+  entry(clump: ptr, addr: ptr, size: i64, offset: i64):
+    %o = call i64 _find_next_bit(addr, size, offset)
+    %eq = icmp.eq i64 %o, size
+    condbr %eq, retz(size), go(clump, addr, %o)
+  go(clump: ptr, addr: ptr, o: i64):
+    %o2 = and i64 o, -8
+    %v = call i64 klfb_read8(addr, %o2)
+    store i64 clump, %v
+    ret %o2
+  retz(size: i64):
+    ret size
+}
+
+fn find_random_bit(ptr, i64) -> i64 {
+  entry(addr: ptr, size: i64):
+    %sz32 = trunc i32 size
+    %w = call i32 __bitmap_weight(addr, %sz32)
+    %wz = icmp.eq i32 %w, 0
+    condbr %wz, retz(size), chk1(addr, size, %w)
+  chk1(addr: ptr, size: i64, w: i32):
+    %w1 = icmp.eq i32 w, 1
+    condbr %w1, one(addr, size), many(addr, size, w)
+  one(addr: ptr, size: i64):
+    %r = call i64 _find_first_bit(addr, size)
+    ret %r
+  many(addr: ptr, size: i64, w: i32):
+    %rv = call i32 __get_random_u32_below(w)
+    %rz = zext i64 %rv
+    %r = call i64 __find_nth_bit(addr, size, %rz)
+    ret %r
+  retz(size: i64):
+    ret size
+}

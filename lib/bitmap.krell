@@ -1,0 +1,1269 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; lib/bitmap.c converted to Krell (Phase 1 batch 5).
+;
+; The word-loop operations are operation-for-operation
+; mirrors.  Notes:
+; - test_bit()/set_bit() from the remap family: the C forms
+;   are the arch bitops (locked BTS on x86); set_bit is
+;   mirrored with an atomic aor, test_bit with a plain load
+;   and test, which is its observable result.
+; - bitmap_zero() is an inline that memsets the words; the
+;   Krell form zeroes them with a loop (klbm_zero), the same
+;   contract.
+; - bitmap_pos_to_ord() is a file-local static in C; it is
+;   klbm_pos_to_ord here.
+; - The allocation wrappers call the slab entry points
+;   the kmalloc_array / kmalloc_array_node inlines reduce
+;   to (__kmalloc_noprof / __kmalloc_node_noprof), and
+;   kfree, externally, as in C.
+;   __GFP_ZERO is 0x100, GFP flags pass through.
+; - Residue: devm_bitmap_alloc / devm_bitmap_zalloc stay C
+;   -- they register the file-local static devm_bitmap_free
+;   callback with devm_add_action_or_reset, and that static
+;   function's address cannot be named from Krell.
+; - bitmap_from_arr64 / bitmap_to_arr64 are 32-bit-only
+;   (BITS_PER_LONG == 32) and have no x86_64 instance.
+
+extern memset(ptr, i32, i64) -> ptr
+extern memmove(ptr, ptr, i64) -> ptr
+; kmalloc_array / kmalloc_array_node are slab.h inlines in C:
+; bytes = n * size (the overflow check cannot fire for a
+; u32 nbits: BITS_TO_LONGS(nbits) * 8 < 2^30), then the
+; non-constant path of _kmalloc_noprof / _kmalloc_array_node
+; lands in __kmalloc_noprof / __kmalloc_node_noprof.
+extern __kmalloc_noprof(i64, i32) -> ptr
+extern __kmalloc_node_noprof(i64, i32, i32) -> ptr
+extern kfree(ptr) -> void
+extern _find_first_bit(ptr, i64) -> i64
+extern _find_next_bit(ptr, i64, i64) -> i64
+extern _find_next_zero_bit(ptr, i64, i64) -> i64
+extern _find_last_bit(ptr, i64) -> i64
+extern __find_nth_bit(ptr, i64, i64) -> i64
+
+fn klbm_lastmask(i64) -> i64 {
+  entry(n: i64):
+    %m = and i64 n, 63
+    %nz = icmp.ne i64 %m, 0
+    %sh = shl i64 1, %m
+    %mm = sub i64 %sh, 1
+    %all = sub i64 0, 1
+    %r = select i64 %nz, %mm, %all
+    ret %r
+}
+
+; pointer identity through the alloca type-punning bridge
+fn klbm_ptreq(ptr, ptr) -> i64 {
+  entry(a: ptr, b: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    store ptr %slot, a
+    %av = load i64, %slot
+    store ptr %slot, b
+    %bv = load i64, %slot
+    %eq = icmp.eq i64 %av, %bv
+    %r = select i64 %eq, 1, 0
+    ret %r
+}
+
+fn klbm_zero(ptr, i64) -> void {
+  entry(dst: ptr, nr: i64):
+    br head(dst, nr, 0)
+  head(dst: ptr, nr: i64, k: i64):
+    %c = icmp.ult i64 k, nr
+    condbr %c, body(dst, nr, k), done()
+  body(dst: ptr, nr: i64, k: i64):
+    %p = gep i64 dst, k
+    store i64 %p, 0
+    %k2 = add i64 k, 1
+    br head(dst, nr, %k2)
+  done():
+    ret
+}
+
+fn klbm_set_bit(i64, ptr) -> void {
+  entry(nr: i64, addr: ptr):
+    %idx = udiv i64 nr, 64
+    %p = gep i64 addr, %idx
+    %off = and i64 nr, 63
+    %m = shl i64 1, %off
+    %old = aor.acqrel i64 %p, %m
+    ret
+}
+
+fn klbm_test_bit(i64, ptr) -> i64 {
+  entry(nr: i64, addr: ptr):
+    %idx = udiv i64 nr, 64
+    %p = gep i64 addr, %idx
+    %w = load i64, %p
+    %off = and i64 nr, 63
+    %v = lshr i64 %w, %off
+    %r = and i64 %v, 1
+    ret %r
+}
+
+fn __bitmap_equal(ptr, ptr, i32) -> i64 {
+  entry(b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, %bits, %lim, 0)
+  head(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(b1, b2, bits, lim, k), tail(b1, b2, bits, k)
+  body(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %ne = icmp.ne i64 %x, %y
+    condbr %ne, no(), next(b1, b2, bits, lim, k)
+  next(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %k2 = add i64 k, 1
+    br head(b1, b2, bits, lim, %k2)
+  tail(b1: ptr, b2: ptr, bits: i64, k: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, check(b1, b2, bits, k), yes()
+  check(b1: ptr, b2: ptr, bits: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %d = xor i64 %x, %y
+    %lm = call i64 klbm_lastmask(bits)
+    %t = and i64 %d, %lm
+    %z = icmp.eq i64 %t, 0
+    condbr %z, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn __bitmap_or_equal(ptr, ptr, ptr, i32) -> i64 {
+  entry(b1: ptr, b2: ptr, b3: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, b3, %bits, %lim, 0)
+  head(b1: ptr, b2: ptr, b3: ptr, bits: i64, lim: i64, k: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(b1, b2, b3, bits, lim, k), tail(b1, b2, b3, bits, k)
+  body(b1: ptr, b2: ptr, b3: ptr, bits: i64, lim: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %p3 = gep i64 b3, k
+    %z = load i64, %p3
+    %o = or i64 %x, %y
+    %ne = icmp.ne i64 %o, %z
+    condbr %ne, no(), next(b1, b2, b3, bits, lim, k)
+  next(b1: ptr, b2: ptr, b3: ptr, bits: i64, lim: i64, k: i64):
+    %k2 = add i64 k, 1
+    br head(b1, b2, b3, bits, lim, %k2)
+  tail(b1: ptr, b2: ptr, b3: ptr, bits: i64, k: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, check(b1, b2, b3, bits, k), yes()
+  check(b1: ptr, b2: ptr, b3: ptr, bits: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %p3 = gep i64 b3, k
+    %z = load i64, %p3
+    %o = or i64 %x, %y
+    %d = xor i64 %o, %z
+    %lm = call i64 klbm_lastmask(bits)
+    %t = and i64 %d, %lm
+    %zz = icmp.eq i64 %t, 0
+    condbr %zz, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn __bitmap_complement(ptr, ptr, i32) -> void {
+  entry(dst: ptr, src: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %t = add i64 %bits, 63
+    %nr = udiv i64 %t, 64
+    br head(dst, src, %nr, 0)
+  head(dst: ptr, src: ptr, nr: i64, k: i64):
+    %c = icmp.ult i64 k, nr
+    condbr %c, body(dst, src, nr, k), done()
+  body(dst: ptr, src: ptr, nr: i64, k: i64):
+    %p = gep i64 src, k
+    %x = load i64, %p
+    %all = sub i64 0, 1
+    %v = xor i64 %x, %all
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %k2 = add i64 k, 1
+    br head(dst, src, nr, %k2)
+  done():
+    ret
+}
+
+fn __bitmap_shift_right(ptr, ptr, i32, i32) -> void {
+  entry(dst: ptr, src: ptr, sh32: i32, nb32: i32):
+    %shift = zext i64 sh32
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %lim = udiv i64 %t, 64
+    %off = udiv i64 %shift, 64
+    %rem = urem i64 %shift, 64
+    %mask = call i64 klbm_lastmask(%nbits)
+    br head(dst, src, %lim, %off, %rem, %mask, 0)
+  head(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64):
+    %ok = add i64 off, k
+    %c = icmp.ult i64 %ok, lim
+    condbr %c, body(dst, src, lim, off, rem, mask, k), tail(dst, lim, off)
+  body(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64):
+    %ok = add i64 off, k
+    %rnz = icmp.ne i64 rem, 0
+    condbr %rnz, chkin(dst, src, lim, off, rem, mask, k, %ok), noup(dst, src, lim, off, rem, mask, k, %ok, 0)
+  chkin(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, ok: i64):
+    %ok1 = add i64 ok, 1
+    %inb = icmp.ult i64 %ok1, lim
+    condbr %inb, withup(dst, src, lim, off, rem, mask, k, ok), noup(dst, src, lim, off, rem, mask, k, ok, 0)
+  withup(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, ok: i64):
+    %ok1 = add i64 ok, 1
+    %p = gep i64 src, %ok1
+    %u = load i64, %p
+    %lm1 = sub i64 lim, 1
+    %last = icmp.eq i64 %ok1, %lm1
+    condbr %last, upl(dst, src, lim, off, rem, mask, k, ok, %u, mask), upn(dst, src, lim, off, rem, mask, k, ok, %u)
+  upl(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, ok: i64, u: i64, m: i64):
+    %um = and i64 u, m
+    br upn(dst, src, lim, off, rem, mask, k, ok, %um)
+  upn(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, ok: i64, u: i64):
+    %sh = sub i64 64, rem
+    %up = shl i64 u, %sh
+    br noup(dst, src, lim, off, rem, mask, k, ok, %up)
+  noup(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, ok: i64, upper: i64):
+    %p = gep i64 src, ok
+    %lo = load i64, %p
+    %lm1 = sub i64 lim, 1
+    %last = icmp.eq i64 ok, %lm1
+    condbr %last, lowm(dst, src, lim, off, rem, mask, k, %lo, mask, upper), lown(dst, src, lim, off, rem, mask, k, %lo, upper)
+  lowm(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, lo: i64, m: i64, upper: i64):
+    %lom = and i64 lo, m
+    br lown(dst, src, lim, off, rem, mask, k, %lom, upper)
+  lown(dst: ptr, src: ptr, lim: i64, off: i64, rem: i64, mask: i64, k: i64, lo: i64, upper: i64):
+    %ls = lshr i64 lo, rem
+    %v = or i64 %ls, upper
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %k2 = add i64 k, 1
+    br head(dst, src, lim, off, rem, mask, %k2)
+  tail(dst: ptr, lim: i64, off: i64):
+    %onz = icmp.ne i64 off, 0
+    condbr %onz, zero(dst, lim, off), done()
+  zero(dst: ptr, lim: i64, off: i64):
+    %at = sub i64 lim, off
+    %q = gep i64 dst, %at
+    %n = shl i64 off, 3
+    %r = call ptr memset(%q, 0, %n)
+    br done()
+  done():
+    ret
+}
+
+fn __bitmap_shift_left(ptr, ptr, i32, i32) -> void {
+  entry(dst: ptr, src: ptr, sh32: i32, nb32: i32):
+    %shift = zext i64 sh32
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %lim = udiv i64 %t, 64
+    %off = udiv i64 %shift, 64
+    %rem = urem i64 %shift, 64
+    %k0 = sub i64 %lim, %off
+    %k1 = sub i64 %k0, 1
+    br head(dst, src, %off, %rem, %k1)
+  head(dst: ptr, src: ptr, off: i64, rem: i64, k: i64):
+    %ge = icmp.sge i64 k, 0
+    condbr %ge, body(dst, src, off, rem, k), tail(dst, off)
+  body(dst: ptr, src: ptr, off: i64, rem: i64, k: i64):
+    %rnz = icmp.ne i64 rem, 0
+    condbr %rnz, chkp(dst, src, off, rem, k), nolo(dst, src, off, rem, k, 0)
+  chkp(dst: ptr, src: ptr, off: i64, rem: i64, k: i64):
+    %kp = icmp.sgt i64 k, 0
+    condbr %kp, withlo(dst, src, off, rem, k), nolo(dst, src, off, rem, k, 0)
+  withlo(dst: ptr, src: ptr, off: i64, rem: i64, k: i64):
+    %km = sub i64 k, 1
+    %p = gep i64 src, %km
+    %x = load i64, %p
+    %sh = sub i64 64, rem
+    %lo = lshr i64 %x, %sh
+    br nolo(dst, src, off, rem, k, %lo)
+  nolo(dst: ptr, src: ptr, off: i64, rem: i64, k: i64, lower: i64):
+    %p = gep i64 src, k
+    %x = load i64, %p
+    %up = shl i64 %x, rem
+    %v = or i64 lower, %up
+    %at = add i64 k, off
+    %q = gep i64 dst, %at
+    store i64 %q, %v
+    %k2 = sub i64 k, 1
+    br head(dst, src, off, rem, %k2)
+  tail(dst: ptr, off: i64):
+    %onz = icmp.ne i64 off, 0
+    condbr %onz, zero(dst, off), done()
+  zero(dst: ptr, off: i64):
+    %n = shl i64 off, 3
+    %r = call ptr memset(dst, 0, %n)
+    br done()
+  done():
+    ret
+}
+
+fn bitmap_cut(ptr, ptr, i32, i32, i32) -> void {
+  entry(dst: ptr, src: ptr, f32: i32, c32: i32, nb32: i32):
+    %first = zext i64 f32
+    %cut = zext i64 c32
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %len = udiv i64 %t, 64
+    %m6 = and i64 %first, 63
+    %fnz = icmp.ne i64 %m6, 0
+    condbr %fnz, keepc(dst, src, %first, %cut, %len), move(dst, src, %first, %cut, %len, 0)
+  keepc(dst: ptr, src: ptr, first: i64, cut: i64, len: i64):
+    %idx = udiv i64 first, 64
+    %p = gep i64 src, %idx
+    %w = load i64, %p
+    %m6 = and i64 first, 63
+    %sh = sub i64 64, %m6
+    %all = sub i64 0, 1
+    %km = lshr i64 %all, %sh
+    %keep = and i64 %w, %km
+    br move(dst, src, first, cut, len, %keep)
+  move(dst: ptr, src: ptr, first: i64, cut: i64, len: i64, keep: i64):
+    %n = shl i64 len, 3
+    %r = call ptr memmove(dst, src, %n)
+    %w0 = udiv i64 first, 64
+    br outer(dst, first, cut, len, keep, %w0)
+  outer(dst: ptr, first: i64, cut: i64, len: i64, keep: i64, w0: i64):
+    %cz = icmp.eq i64 cut, 0
+    condbr %cz, finish(dst, first, keep), pass(dst, first, cut, len, keep, w0, w0)
+  pass(dst: ptr, first: i64, cut: i64, len: i64, keep: i64, w0: i64, i: i64):
+    %c = icmp.ult i64 i, len
+    condbr %c, pbody(dst, first, cut, len, keep, w0, i), pend(dst, first, cut, len, keep, w0)
+  pbody(dst: ptr, first: i64, cut: i64, len: i64, keep: i64, w0: i64, i: i64):
+    %lm1 = sub i64 len, 1
+    %lt = icmp.ult i64 i, %lm1
+    condbr %lt, withc(dst, first, cut, len, keep, w0, i), noc(dst, first, cut, len, keep, w0, i, 0)
+  withc(dst: ptr, first: i64, cut: i64, len: i64, keep: i64, w0: i64, i: i64):
+    %i1 = add i64 i, 1
+    %p = gep i64 dst, %i1
+    %w = load i64, %p
+    %carry = and i64 %w, 1
+    br noc(dst, first, cut, len, keep, w0, i, %carry)
+  noc(dst: ptr, first: i64, cut: i64, len: i64, keep: i64, w0: i64, i: i64, carry: i64):
+    %p = gep i64 dst, i
+    %w = load i64, %p
+    %lo = lshr i64 %w, 1
+    %hi = shl i64 carry, 63
+    %v = or i64 %lo, %hi
+    store i64 %p, %v
+    %i2 = add i64 i, 1
+    br pass(dst, first, cut, len, keep, w0, %i2)
+  pend(dst: ptr, first: i64, cut: i64, len: i64, keep: i64, w0: i64):
+    %c2 = sub i64 cut, 1
+    br outer(dst, first, %c2, len, keep, w0)
+  finish(dst: ptr, first: i64, keep: i64):
+    %idx = udiv i64 first, 64
+    %p = gep i64 dst, %idx
+    %w = load i64, %p
+    %m6 = and i64 first, 63
+    %all = sub i64 0, 1
+    %fm = shl i64 %all, %m6
+    %v = and i64 %w, %fm
+    %v2 = or i64 %v, keep
+    store i64 %p, %v2
+    ret
+}
+
+fn __bitmap_and(ptr, ptr, ptr, i32) -> i64 {
+  entry(dst: ptr, b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(dst, b1, b2, %bits, %lim, 0, 0)
+  head(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64, res: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(dst, b1, b2, bits, lim, k, res), tail(dst, b1, b2, bits, k, res)
+  body(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64, res: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %v = and i64 %x, %y
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %r2 = or i64 res, %v
+    %k2 = add i64 k, 1
+    br head(dst, b1, b2, bits, lim, %k2, %r2)
+  tail(dst: ptr, b1: ptr, b2: ptr, bits: i64, k: i64, res: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(dst, b1, b2, bits, k, res), done(res)
+  tcheck(dst: ptr, b1: ptr, b2: ptr, bits: i64, k: i64, res: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %xy = and i64 %x, %y
+    %lm = call i64 klbm_lastmask(bits)
+    %v = and i64 %xy, %lm
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %r2 = or i64 res, %v
+    br done(%r2)
+  done(res: i64):
+    %z = icmp.ne i64 res, 0
+    %r = select i64 %z, 1, 0
+    ret %r
+}
+
+fn __bitmap_or(ptr, ptr, ptr, i32) -> void {
+  entry(dst: ptr, b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %t = add i64 %bits, 63
+    %nr = udiv i64 %t, 64
+    br head(dst, b1, b2, %nr, 0)
+  head(dst: ptr, b1: ptr, b2: ptr, nr: i64, k: i64):
+    %c = icmp.ult i64 k, nr
+    condbr %c, body(dst, b1, b2, nr, k), done()
+  body(dst: ptr, b1: ptr, b2: ptr, nr: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %v = or i64 %x, %y
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %k2 = add i64 k, 1
+    br head(dst, b1, b2, nr, %k2)
+  done():
+    ret
+}
+
+fn __bitmap_xor(ptr, ptr, ptr, i32) -> void {
+  entry(dst: ptr, b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %t = add i64 %bits, 63
+    %nr = udiv i64 %t, 64
+    br head(dst, b1, b2, %nr, 0)
+  head(dst: ptr, b1: ptr, b2: ptr, nr: i64, k: i64):
+    %c = icmp.ult i64 k, nr
+    condbr %c, body(dst, b1, b2, nr, k), done()
+  body(dst: ptr, b1: ptr, b2: ptr, nr: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %v = xor i64 %x, %y
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %k2 = add i64 k, 1
+    br head(dst, b1, b2, nr, %k2)
+  done():
+    ret
+}
+
+fn __bitmap_andnot(ptr, ptr, ptr, i32) -> i64 {
+  entry(dst: ptr, b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(dst, b1, b2, %bits, %lim, 0, 0)
+  head(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64, res: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(dst, b1, b2, bits, lim, k, res), tail(dst, b1, b2, bits, k, res)
+  body(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64, res: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %v = and i64 %x, %ny
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %r2 = or i64 res, %v
+    %k2 = add i64 k, 1
+    br head(dst, b1, b2, bits, lim, %k2, %r2)
+  tail(dst: ptr, b1: ptr, b2: ptr, bits: i64, k: i64, res: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(dst, b1, b2, bits, k, res), done(res)
+  tcheck(dst: ptr, b1: ptr, b2: ptr, bits: i64, k: i64, res: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %xy = and i64 %x, %ny
+    %lm = call i64 klbm_lastmask(bits)
+    %v = and i64 %xy, %lm
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %r2 = or i64 res, %v
+    br done(%r2)
+  done(res: i64):
+    %z = icmp.ne i64 res, 0
+    %r = select i64 %z, 1, 0
+    ret %r
+}
+
+fn __bitmap_replace(ptr, ptr, ptr, ptr, i32) -> void {
+  entry(dst: ptr, old: ptr, new: ptr, mask: ptr, nb32: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %nr = udiv i64 %t, 64
+    br head(dst, old, new, mask, %nr, 0)
+  head(dst: ptr, old: ptr, new: ptr, mask: ptr, nr: i64, k: i64):
+    %c = icmp.ult i64 k, nr
+    condbr %c, body(dst, old, new, mask, nr, k), done()
+  body(dst: ptr, old: ptr, new: ptr, mask: ptr, nr: i64, k: i64):
+    %po = gep i64 old, k
+    %o = load i64, %po
+    %pn = gep i64 new, k
+    %n = load i64, %pn
+    %pm = gep i64 mask, k
+    %m = load i64, %pm
+    %all = sub i64 0, 1
+    %nm = xor i64 %m, %all
+    %a = and i64 %o, %nm
+    %b = and i64 %n, %m
+    %v = or i64 %a, %b
+    %q = gep i64 dst, k
+    store i64 %q, %v
+    %k2 = add i64 k, 1
+    br head(dst, old, new, mask, nr, %k2)
+  done():
+    ret
+}
+
+fn __bitmap_intersects(ptr, ptr, i32) -> i64 {
+  entry(b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, %bits, %lim, 0)
+  head(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(b1, b2, bits, lim, k), tail(b1, b2, bits, k)
+  body(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %v = and i64 %x, %y
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, yes(), next(b1, b2, bits, lim, k)
+  next(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %k2 = add i64 k, 1
+    br head(b1, b2, bits, lim, %k2)
+  tail(b1: ptr, b2: ptr, bits: i64, k: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, check(b1, b2, bits, k), no()
+  check(b1: ptr, b2: ptr, bits: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %v = and i64 %x, %y
+    %lm = call i64 klbm_lastmask(bits)
+    %t = and i64 %v, %lm
+    %z = icmp.ne i64 %t, 0
+    condbr %z, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn __bitmap_intersects_and(ptr, ptr, ptr, i32) -> i64 {
+  entry(b1: ptr, b2: ptr, b3: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, b3, %bits, %lim, 0)
+  head(b1: ptr, b2: ptr, b3: ptr, bits: i64, lim: i64, k: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(b1, b2, b3, bits, lim, k), tail(b1, b2, b3, bits, k)
+  body(b1: ptr, b2: ptr, b3: ptr, bits: i64, lim: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %p3 = gep i64 b3, k
+    %z = load i64, %p3
+    %xy = and i64 %x, %y
+    %v = and i64 %xy, %z
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, yes(), next(b1, b2, b3, bits, lim, k)
+  next(b1: ptr, b2: ptr, b3: ptr, bits: i64, lim: i64, k: i64):
+    %k2 = add i64 k, 1
+    br head(b1, b2, b3, bits, lim, %k2)
+  tail(b1: ptr, b2: ptr, b3: ptr, bits: i64, k: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, check(b1, b2, b3, bits, k), no()
+  check(b1: ptr, b2: ptr, b3: ptr, bits: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %p3 = gep i64 b3, k
+    %z = load i64, %p3
+    %xy = and i64 %x, %y
+    %v = and i64 %xy, %z
+    %lm = call i64 klbm_lastmask(bits)
+    %t = and i64 %v, %lm
+    %zz = icmp.ne i64 %t, 0
+    condbr %zz, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn __bitmap_subset(ptr, ptr, i32) -> i64 {
+  entry(b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, %bits, %lim, 0)
+  head(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %c = icmp.ult i64 k, lim
+    condbr %c, body(b1, b2, bits, lim, k), tail(b1, b2, bits, k)
+  body(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %v = and i64 %x, %ny
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, no(), next(b1, b2, bits, lim, k)
+  next(b1: ptr, b2: ptr, bits: i64, lim: i64, k: i64):
+    %k2 = add i64 k, 1
+    br head(b1, b2, bits, lim, %k2)
+  tail(b1: ptr, b2: ptr, bits: i64, k: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, check(b1, b2, bits, k), yes()
+  check(b1: ptr, b2: ptr, bits: i64, k: i64):
+    %p1 = gep i64 b1, k
+    %x = load i64, %p1
+    %p2 = gep i64 b2, k
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %v = and i64 %x, %ny
+    %lm = call i64 klbm_lastmask(bits)
+    %t = and i64 %v, %lm
+    %z = icmp.ne i64 %t, 0
+    condbr %z, no(), yes()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn __bitmap_weight(ptr, i32) -> i32 {
+  entry(bm: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(bm, %bits, %lim, 0, 0)
+  head(bm: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %c = icmp.ult i64 idx, lim
+    condbr %c, body(bm, bits, lim, idx, w), tail(bm, bits, idx, w)
+  body(bm: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %p = gep i64 bm, idx
+    %x = load i64, %p
+    %pc = popcount i64 %x
+    %w2 = add i64 w, %pc
+    %i2 = add i64 idx, 1
+    br head(bm, bits, lim, %i2, %w2)
+  tail(bm: ptr, bits: i64, idx: i64, w: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(bm, bits, idx, w), done(w)
+  tcheck(bm: ptr, bits: i64, idx: i64, w: i64):
+    %p = gep i64 bm, idx
+    %x = load i64, %p
+    %lm = call i64 klbm_lastmask(bits)
+    %v = and i64 %x, %lm
+    %pc = popcount i64 %v
+    %w2 = add i64 w, %pc
+    br done(%w2)
+  done(w: i64):
+    %r = trunc i32 w
+    ret %r
+}
+
+fn __bitmap_weight_and(ptr, ptr, i32) -> i32 {
+  entry(b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, %bits, %lim, 0, 0)
+  head(b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %c = icmp.ult i64 idx, lim
+    condbr %c, body(b1, b2, bits, lim, idx, w), tail(b1, b2, bits, idx, w)
+  body(b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %v = and i64 %x, %y
+    %pc = popcount i64 %v
+    %w2 = add i64 w, %pc
+    %i2 = add i64 idx, 1
+    br head(b1, b2, bits, lim, %i2, %w2)
+  tail(b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(b1, b2, bits, idx, w), done(w)
+  tcheck(b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %v = and i64 %x, %y
+    %lm = call i64 klbm_lastmask(bits)
+    %vm = and i64 %v, %lm
+    %pc = popcount i64 %vm
+    %w2 = add i64 w, %pc
+    br done(%w2)
+  done(w: i64):
+    %r = trunc i32 w
+    ret %r
+}
+
+fn __bitmap_weight_andnot(ptr, ptr, i32) -> i32 {
+  entry(b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(b1, b2, %bits, %lim, 0, 0)
+  head(b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %c = icmp.ult i64 idx, lim
+    condbr %c, body(b1, b2, bits, lim, idx, w), tail(b1, b2, bits, idx, w)
+  body(b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %v = and i64 %x, %ny
+    %pc = popcount i64 %v
+    %w2 = add i64 w, %pc
+    %i2 = add i64 idx, 1
+    br head(b1, b2, bits, lim, %i2, %w2)
+  tail(b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(b1, b2, bits, idx, w), done(w)
+  tcheck(b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %all = sub i64 0, 1
+    %ny = xor i64 %y, %all
+    %v = and i64 %x, %ny
+    %lm = call i64 klbm_lastmask(bits)
+    %vm = and i64 %v, %lm
+    %pc = popcount i64 %vm
+    %w2 = add i64 w, %pc
+    br done(%w2)
+  done(w: i64):
+    %r = trunc i32 w
+    ret %r
+}
+
+fn __bitmap_weighted_or(ptr, ptr, ptr, i32) -> i32 {
+  entry(dst: ptr, b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(dst, b1, b2, %bits, %lim, 0, 0)
+  head(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %c = icmp.ult i64 idx, lim
+    condbr %c, body(dst, b1, b2, bits, lim, idx, w), tail(dst, b1, b2, bits, idx, w)
+  body(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %v = or i64 %x, %y
+    %q = gep i64 dst, idx
+    store i64 %q, %v
+    %pc = popcount i64 %v
+    %w2 = add i64 w, %pc
+    %i2 = add i64 idx, 1
+    br head(dst, b1, b2, bits, lim, %i2, %w2)
+  tail(dst: ptr, b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(dst, b1, b2, bits, idx, w), done(w)
+  tcheck(dst: ptr, b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %v = or i64 %x, %y
+    %q = gep i64 dst, idx
+    store i64 %q, %v
+    %lm = call i64 klbm_lastmask(bits)
+    %vm = and i64 %v, %lm
+    %pc = popcount i64 %vm
+    %w2 = add i64 w, %pc
+    br done(%w2)
+  done(w: i64):
+    %r = trunc i32 w
+    ret %r
+}
+
+fn __bitmap_weighted_xor(ptr, ptr, ptr, i32) -> i32 {
+  entry(dst: ptr, b1: ptr, b2: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %lim = udiv i64 %bits, 64
+    br head(dst, b1, b2, %bits, %lim, 0, 0)
+  head(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %c = icmp.ult i64 idx, lim
+    condbr %c, body(dst, b1, b2, bits, lim, idx, w), tail(dst, b1, b2, bits, idx, w)
+  body(dst: ptr, b1: ptr, b2: ptr, bits: i64, lim: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %v = xor i64 %x, %y
+    %q = gep i64 dst, idx
+    store i64 %q, %v
+    %pc = popcount i64 %v
+    %w2 = add i64 w, %pc
+    %i2 = add i64 idx, 1
+    br head(dst, b1, b2, bits, lim, %i2, %w2)
+  tail(dst: ptr, b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %m = and i64 bits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(dst, b1, b2, bits, idx, w), done(w)
+  tcheck(dst: ptr, b1: ptr, b2: ptr, bits: i64, idx: i64, w: i64):
+    %p1 = gep i64 b1, idx
+    %x = load i64, %p1
+    %p2 = gep i64 b2, idx
+    %y = load i64, %p2
+    %v = xor i64 %x, %y
+    %q = gep i64 dst, idx
+    store i64 %q, %v
+    %lm = call i64 klbm_lastmask(bits)
+    %vm = and i64 %v, %lm
+    %pc = popcount i64 %vm
+    %w2 = add i64 w, %pc
+    br done(%w2)
+  done(w: i64):
+    %r = trunc i32 w
+    ret %r
+}
+
+fn __bitmap_set(ptr, i32, i32) -> void {
+  entry(map: ptr, st32: i32, len32: i32):
+    %start = zext i64 st32
+    %len = sext i64 len32
+    %sum = add i32 st32, len32
+    %size = zext i64 %sum
+    %wi = udiv i64 %start, 64
+    %p = gep i64 map, %wi
+    %m6 = and i64 %start, 63
+    %bts = sub i64 64, %m6
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    br head(%p, %len, %bts, %mask, %size)
+  head(p: ptr, len: i64, bts: i64, mask: i64, size: i64):
+    %d = sub i64 len, bts
+    %ge = icmp.sge i64 %d, 0
+    condbr %ge, body(p, len, bts, mask, size), tail(p, len, mask, size)
+  body(p: ptr, len: i64, bts: i64, mask: i64, size: i64):
+    %w = load i64, p
+    %v = or i64 %w, mask
+    store i64 p, %v
+    %len2 = sub i64 len, bts
+    %p2 = gep i64 p, 1
+    %all = sub i64 0, 1
+    br head(%p2, %len2, 64, %all, size)
+  tail(p: ptr, len: i64, mask: i64, size: i64):
+    %nz = icmp.ne i64 len, 0
+    condbr %nz, tcheck(p, mask, size), done()
+  tcheck(p: ptr, mask: i64, size: i64):
+    %lm = call i64 klbm_lastmask(size)
+    %m = and i64 mask, %lm
+    %w = load i64, p
+    %v = or i64 %w, %m
+    store i64 p, %v
+    br done()
+  done():
+    ret
+}
+
+fn __bitmap_clear(ptr, i32, i32) -> void {
+  entry(map: ptr, st32: i32, len32: i32):
+    %start = zext i64 st32
+    %len = sext i64 len32
+    %sum = add i32 st32, len32
+    %size = zext i64 %sum
+    %wi = udiv i64 %start, 64
+    %p = gep i64 map, %wi
+    %m6 = and i64 %start, 63
+    %btc = sub i64 64, %m6
+    %all = sub i64 0, 1
+    %mask = shl i64 %all, %m6
+    br head(%p, %len, %btc, %mask, %size)
+  head(p: ptr, len: i64, btc: i64, mask: i64, size: i64):
+    %d = sub i64 len, btc
+    %ge = icmp.sge i64 %d, 0
+    condbr %ge, body(p, len, btc, mask, size), tail(p, len, mask, size)
+  body(p: ptr, len: i64, btc: i64, mask: i64, size: i64):
+    %w = load i64, p
+    %all = sub i64 0, 1
+    %nm = xor i64 mask, %all
+    %v = and i64 %w, %nm
+    store i64 p, %v
+    %len2 = sub i64 len, btc
+    %p2 = gep i64 p, 1
+    %all2 = sub i64 0, 1
+    br head(%p2, %len2, 64, %all2, size)
+  tail(p: ptr, len: i64, mask: i64, size: i64):
+    %nz = icmp.ne i64 len, 0
+    condbr %nz, tcheck(p, mask, size), done()
+  tcheck(p: ptr, mask: i64, size: i64):
+    %lm = call i64 klbm_lastmask(size)
+    %m = and i64 mask, %lm
+    %w = load i64, p
+    %all = sub i64 0, 1
+    %nm = xor i64 %m, %all
+    %v = and i64 %w, %nm
+    store i64 p, %v
+    br done()
+  done():
+    ret
+}
+
+fn bitmap_find_next_zero_area_off(ptr, i64, i64, i32, i64, i64) -> i64 {
+  entry(map: ptr, size: i64, start0: i64, nr32: i32, amask: i64, aoff: i64):
+    %nr = zext i64 nr32
+    %s = call i64 _find_next_zero_bit(map, size, start0)
+    br head(map, size, %s, %nr, amask, aoff)
+  head(map: ptr, size: i64, start: i64, nr: i64, amask: i64, aoff: i64):
+    %c = icmp.ult i64 start, size
+    condbr %c, body(map, size, start, nr, amask, aoff), done(size)
+  body(map: ptr, size: i64, start: i64, nr: i64, amask: i64, aoff: i64):
+    %t1 = add i64 start, aoff
+    %t2 = add i64 %t1, amask
+    %all = sub i64 0, 1
+    %nam = xor i64 amask, %all
+    %t3 = and i64 %t2, %nam
+    %st = sub i64 %t3, aoff
+    %end = add i64 %st, nr
+    %over = icmp.ugt i64 %end, size
+    condbr %over, done(size), scan(map, size, %st, %end, nr, amask, aoff)
+  scan(map: ptr, size: i64, st: i64, end: i64, nr: i64, amask: i64, aoff: i64):
+    %off = and i64 st, -64
+    %wi = udiv i64 st, 64
+    %sub = gep i64 map, %wi
+    %span = sub i64 end, %off
+    %lb = call i64 _find_last_bit(%sub, %span)
+    %i = add i64 %lb, %off
+    %ge = icmp.uge i64 %i, end
+    condbr %ge, hit(%st), chk2(map, size, %st, %i, nr, amask, aoff)
+  chk2(map: ptr, size: i64, st: i64, i: i64, nr: i64, amask: i64, aoff: i64):
+    %lt = icmp.ult i64 i, st
+    condbr %lt, hit(%st), again(map, size, %i, nr, amask, aoff)
+  again(map: ptr, size: i64, i: i64, nr: i64, amask: i64, aoff: i64):
+    %ip1 = add i64 i, 1
+    %s = call i64 _find_next_zero_bit(map, size, %ip1)
+    br head(map, size, %s, nr, amask, aoff)
+  hit(st: i64):
+    ret %st
+  done(size: i64):
+    ret size
+}
+
+fn klbm_pos_to_ord(ptr, i32, i32) -> i32 {
+  entry(buf: ptr, pos32: i32, nb32: i32):
+    %ge = icmp.uge i32 pos32, nb32
+    condbr %ge, neg(), chk(buf, pos32, nb32)
+  chk(buf: ptr, pos32: i32, nb32: i32):
+    %pos = zext i64 pos32
+    %tb = call i64 klbm_test_bit(%pos, buf)
+    %z = icmp.eq i64 %tb, 0
+    condbr %z, neg(), go(buf, pos32)
+  go(buf: ptr, pos32: i32):
+    %w = call i32 __bitmap_weight(buf, pos32)
+    ret %w
+  neg():
+    %m = sub i32 0, 1
+    ret %m
+}
+
+fn bitmap_remap(ptr, ptr, ptr, ptr, i32) -> void {
+  entry(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32):
+    %eq = call i64 klbm_ptreq(dst, src)
+    %isz = icmp.ne i64 %eq, 0
+    condbr %isz, done(), go(dst, src, old, new, nb32)
+  go(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %nr = udiv i64 %t, 64
+    call void klbm_zero(dst, %nr)
+    %w = call i32 __bitmap_weight(new, nb32)
+    %wz = zext i64 %w
+    %first = call i64 _find_first_bit(src, %nbits)
+    br head(dst, src, old, new, nb32, %nbits, %wz, %first)
+  head(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32, nbits: i64, w: i64, bit: i64):
+    %c = icmp.ult i64 bit, nbits
+    condbr %c, body(dst, src, old, new, nb32, nbits, w, bit), done()
+  body(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32, nbits: i64, w: i64, bit: i64):
+    %b32 = trunc i32 bit
+    %n = call i32 klbm_pos_to_ord(old, %b32, nb32)
+    %nlt = icmp.slt i32 %n, 0
+    condbr %nlt, ident(dst, src, old, new, nb32, nbits, w, bit), chkz(dst, src, old, new, nb32, nbits, w, bit, %n)
+  chkz(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32, nbits: i64, w: i64, bit: i64, n: i32):
+    %wz = icmp.eq i64 w, 0
+    condbr %wz, ident(dst, src, old, new, nb32, nbits, w, bit), mapped(dst, src, old, new, nb32, nbits, w, bit, n)
+  ident(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32, nbits: i64, w: i64, bit: i64):
+    call void klbm_set_bit(bit, dst)
+    br next(dst, src, old, new, nb32, nbits, w, bit)
+  mapped(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32, nbits: i64, w: i64, bit: i64, n: i32):
+    %ne = sext i64 n
+    %m = urem i64 %ne, w
+    %tgt = call i64 __find_nth_bit(new, nbits, %m)
+    call void klbm_set_bit(%tgt, dst)
+    br next(dst, src, old, new, nb32, nbits, w, bit)
+  next(dst: ptr, src: ptr, old: ptr, new: ptr, nb32: i32, nbits: i64, w: i64, bit: i64):
+    %bp1 = add i64 bit, 1
+    %nb = call i64 _find_next_bit(src, nbits, %bp1)
+    br head(dst, src, old, new, nb32, nbits, w, %nb)
+  done():
+    ret
+}
+
+fn bitmap_bitremap(i32, ptr, ptr, i32) -> i32 {
+  entry(ob32: i32, old: ptr, new: ptr, bits32: i32):
+    %w = call i32 __bitmap_weight(new, bits32)
+    %n = call i32 klbm_pos_to_ord(old, ob32, bits32)
+    %nlt = icmp.slt i32 %n, 0
+    condbr %nlt, id(ob32), chkz(ob32, new, bits32, %w, %n)
+  chkz(ob32: i32, new: ptr, bits32: i32, w: i32, n: i32):
+    %wz = icmp.eq i32 w, 0
+    condbr %wz, id(ob32), mapped(new, bits32, w, n)
+  mapped(new: ptr, bits32: i32, w: i32, n: i32):
+    %ne = sext i64 n
+    %we = sext i64 w
+    %m = urem i64 %ne, %we
+    %bits = sext i64 bits32
+    %t = call i64 __find_nth_bit(new, %bits, %m)
+    %r = trunc i32 %t
+    ret %r
+  id(ob32: i32):
+    ret ob32
+}
+
+fn bitmap_onto(ptr, ptr, ptr, i32) -> void {
+  entry(dst: ptr, orig: ptr, relmap: ptr, bits32: i32):
+    %eq = call i64 klbm_ptreq(dst, orig)
+    %isz = icmp.ne i64 %eq, 0
+    condbr %isz, done(), go(dst, orig, relmap, bits32)
+  go(dst: ptr, orig: ptr, relmap: ptr, bits32: i32):
+    %bits = zext i64 bits32
+    %t = add i64 %bits, 63
+    %nr = udiv i64 %t, 64
+    call void klbm_zero(dst, %nr)
+    %first = call i64 _find_first_bit(relmap, %bits)
+    br head(dst, orig, relmap, %bits, %first, 0)
+  head(dst: ptr, orig: ptr, relmap: ptr, bits: i64, n: i64, m: i64):
+    %c = icmp.ult i64 n, bits
+    condbr %c, body(dst, orig, relmap, bits, n, m), done()
+  body(dst: ptr, orig: ptr, relmap: ptr, bits: i64, n: i64, m: i64):
+    %tb = call i64 klbm_test_bit(m, orig)
+    %nz = icmp.ne i64 %tb, 0
+    condbr %nz, setb(dst, orig, relmap, bits, n, m), next(dst, orig, relmap, bits, n, m)
+  setb(dst: ptr, orig: ptr, relmap: ptr, bits: i64, n: i64, m: i64):
+    call void klbm_set_bit(n, dst)
+    br next(dst, orig, relmap, bits, n, m)
+  next(dst: ptr, orig: ptr, relmap: ptr, bits: i64, n: i64, m: i64):
+    %np1 = add i64 n, 1
+    %nn = call i64 _find_next_bit(relmap, bits, %np1)
+    %m2 = add i64 m, 1
+    br head(dst, orig, relmap, bits, %nn, %m2)
+  done():
+    ret
+}
+
+fn bitmap_fold(ptr, ptr, i32, i32) -> void {
+  entry(dst: ptr, orig: ptr, sz32: i32, nb32: i32):
+    %eq = call i64 klbm_ptreq(dst, orig)
+    %isz = icmp.ne i64 %eq, 0
+    condbr %isz, done(), go(dst, orig, sz32, nb32)
+  go(dst: ptr, orig: ptr, sz32: i32, nb32: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %nr = udiv i64 %t, 64
+    call void klbm_zero(dst, %nr)
+    %sz = zext i64 sz32
+    %first = call i64 _find_first_bit(orig, %nbits)
+    br head(dst, orig, %sz, %nbits, %first)
+  head(dst: ptr, orig: ptr, sz: i64, nbits: i64, bit: i64):
+    %c = icmp.ult i64 bit, nbits
+    condbr %c, body(dst, orig, sz, nbits, bit), done()
+  body(dst: ptr, orig: ptr, sz: i64, nbits: i64, bit: i64):
+    %m = urem i64 bit, sz
+    call void klbm_set_bit(%m, dst)
+    %bp1 = add i64 bit, 1
+    %nb = call i64 _find_next_bit(orig, nbits, %bp1)
+    br head(dst, orig, sz, nbits, %nb)
+  done():
+    ret
+}
+
+fn bitmap_alloc(i32, i32) -> ptr {
+  entry(nb32: i32, flags: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %nr = udiv i64 %t, 64
+    %bytes = mul i64 %nr, 8
+    %r = call ptr __kmalloc_noprof(%bytes, flags)
+    ret %r
+}
+
+fn bitmap_zalloc(i32, i32) -> ptr {
+  entry(nb32: i32, flags: i32):
+    %f2 = or i32 flags, 256
+    %r = call ptr bitmap_alloc(nb32, %f2)
+    ret %r
+}
+
+fn bitmap_alloc_node(i32, i32, i32) -> ptr {
+  entry(nb32: i32, flags: i32, node: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 63
+    %nr = udiv i64 %t, 64
+    %bytes = mul i64 %nr, 8
+    %r = call ptr __kmalloc_node_noprof(%bytes, flags, node)
+    ret %r
+}
+
+fn bitmap_zalloc_node(i32, i32, i32) -> ptr {
+  entry(nb32: i32, flags: i32, node: i32):
+    %f2 = or i32 flags, 256
+    %r = call ptr bitmap_alloc_node(nb32, %f2, node)
+    ret %r
+}
+
+fn bitmap_free(ptr) -> void {
+  entry(bm: ptr):
+    call void kfree(bm)
+    ret
+}
+
+fn bitmap_from_arr32(ptr, ptr, i32) -> void {
+  entry(bm: ptr, buf: ptr, nb32: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 31
+    %hw = udiv i64 %t, 32
+    br head(bm, buf, %nbits, %hw, 0)
+  head(bm: ptr, buf: ptr, nbits: i64, hw: i64, i: i64):
+    %c = icmp.ult i64 i, hw
+    condbr %c, body(bm, buf, nbits, hw, i), tail(bm, nbits, hw)
+  body(bm: ptr, buf: ptr, nbits: i64, hw: i64, i: i64):
+    %pb = gep i32 buf, i
+    %x = load i32, %pb
+    %xz = zext i64 %x
+    %wi = udiv i64 i, 2
+    %pw = gep i64 bm, %wi
+    store i64 %pw, %xz
+    %i1 = add i64 i, 1
+    %c2 = icmp.ult i64 %i1, hw
+    condbr %c2, hi(bm, buf, nbits, hw, %i1), adv(bm, buf, nbits, hw, %i1)
+  hi(bm: ptr, buf: ptr, nbits: i64, hw: i64, i: i64):
+    %pb = gep i32 buf, i
+    %x = load i32, %pb
+    %xz = zext i64 %x
+    %xh = shl i64 %xz, 32
+    %wi = udiv i64 i, 2
+    %pw = gep i64 bm, %wi
+    %w = load i64, %pw
+    %v = or i64 %w, %xh
+    store i64 %pw, %v
+    br adv(bm, buf, nbits, hw, i)
+  adv(bm: ptr, buf: ptr, nbits: i64, hw: i64, i: i64):
+    %i2 = add i64 i, 1
+    br head(bm, buf, nbits, hw, %i2)
+  tail(bm: ptr, nbits: i64, hw: i64):
+    %m = and i64 nbits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(bm, nbits, hw), done()
+  tcheck(bm: ptr, nbits: i64, hw: i64):
+    %hm = sub i64 hw, 1
+    %wi = udiv i64 %hm, 2
+    %pw = gep i64 bm, %wi
+    %w = load i64, %pw
+    %lm = call i64 klbm_lastmask(nbits)
+    %v = and i64 %w, %lm
+    store i64 %pw, %v
+    br done()
+  done():
+    ret
+}
+
+fn bitmap_to_arr32(ptr, ptr, i32) -> void {
+  entry(buf: ptr, bm: ptr, nb32: i32):
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 31
+    %hw = udiv i64 %t, 32
+    br head(buf, bm, %nbits, %hw, 0)
+  head(buf: ptr, bm: ptr, nbits: i64, hw: i64, i: i64):
+    %c = icmp.ult i64 i, hw
+    condbr %c, body(buf, bm, nbits, hw, i), tail(buf, nbits, hw)
+  body(buf: ptr, bm: ptr, nbits: i64, hw: i64, i: i64):
+    %wi = udiv i64 i, 2
+    %pw = gep i64 bm, %wi
+    %w = load i64, %pw
+    %lo = trunc i32 %w
+    %pb = gep i32 buf, i
+    store i32 %pb, %lo
+    %i1 = add i64 i, 1
+    %c2 = icmp.ult i64 %i1, hw
+    condbr %c2, hi(buf, bm, nbits, hw, %i1), adv(buf, bm, nbits, hw, %i1)
+  hi(buf: ptr, bm: ptr, nbits: i64, hw: i64, i: i64):
+    %wi = udiv i64 i, 2
+    %pw = gep i64 bm, %wi
+    %w = load i64, %pw
+    %h = lshr i64 %w, 32
+    %ht = trunc i32 %h
+    %pb = gep i32 buf, i
+    store i32 %pb, %ht
+    br adv(buf, bm, nbits, hw, i)
+  adv(buf: ptr, bm: ptr, nbits: i64, hw: i64, i: i64):
+    %i2 = add i64 i, 1
+    br head(buf, bm, nbits, hw, %i2)
+  tail(buf: ptr, nbits: i64, hw: i64):
+    %m = and i64 nbits, 63
+    %nz = icmp.ne i64 %m, 0
+    condbr %nz, tcheck(buf, nbits, hw), done()
+  tcheck(buf: ptr, nbits: i64, hw: i64):
+    %neg = sub i64 0, nbits
+    %s = and i64 %neg, 31
+    %s32 = trunc i32 %s
+    %all = sub i32 0, 1
+    %mm = lshr i32 %all, %s32
+    %hm = sub i64 hw, 1
+    %pb = gep i32 buf, %hm
+    %x = load i32, %pb
+    %v = and i32 %x, %mm
+    store i32 %pb, %v
+    br done()
+  done():
+    ret
+}

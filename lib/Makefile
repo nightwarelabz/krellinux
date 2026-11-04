@@ -358,9 +358,11 @@ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
 # in tools/converge/rig/ before it is recorded in CONVERSION.md.
 KRELLC ?= krellc
 obj-y += krell_phase1_check.o krell_string_check.o krell_batch4_check.o \
+	 krell_batch5_check.o \
 	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
 	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o \
-	 string_krell.o kstrtox_krell.o cmdline_krell.o bsearch_krell.o
+	 string_krell.o kstrtox_krell.o cmdline_krell.o bsearch_krell.o \
+	 find_bit_krell.o bitmap_krell.o bitmap-str_krell.o
 
 krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
@@ -424,7 +426,62 @@ krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\bmemparse\b/krell_memparse/g' \
 	-e 's/\bparse_option_str\b/krell_parse_option_str/g' \
 	-e 's/\bnext_arg\b/krell_next_arg/g' \
-	-e 's/\bbsearch\b/krell_bsearch/g'
+	-e 's/\bbsearch\b/krell_bsearch/g' \
+	-e 's/\b__find_nth_and_andnot_bit\b/krell___find_nth_and_andnot_bit/g' \
+	-e 's/\b__find_nth_and_bit\b/krell___find_nth_and_bit/g' \
+	-e 's/\b__find_nth_bit\b/krell___find_nth_bit/g' \
+	-e 's/\b_find_first_and_and_bit\b/krell__find_first_and_and_bit/g' \
+	-e 's/\b_find_first_andnot_bit\b/krell__find_first_andnot_bit/g' \
+	-e 's/\b_find_first_and_bit\b/krell__find_first_and_bit/g' \
+	-e 's/\b_find_first_zero_bit\b/krell__find_first_zero_bit/g' \
+	-e 's/\b_find_first_bit\b/krell__find_first_bit/g' \
+	-e 's/\b_find_next_andnot_bit\b/krell__find_next_andnot_bit/g' \
+	-e 's/\b_find_next_and_bit\b/krell__find_next_and_bit/g' \
+	-e 's/\b_find_next_or_bit\b/krell__find_next_or_bit/g' \
+	-e 's/\b_find_next_zero_bit\b/krell__find_next_zero_bit/g' \
+	-e 's/\b_find_next_bit\b/krell__find_next_bit/g' \
+	-e 's/\b_find_last_bit\b/krell__find_last_bit/g' \
+	-e 's/\bfind_next_clump8\b/krell_find_next_clump8/g' \
+	-e 's/\bfind_random_bit\b/krell_find_random_bit/g' \
+	-e 's/\b__bitmap_weighted_or\b/krell___bitmap_weighted_or/g' \
+	-e 's/\b__bitmap_weighted_xor\b/krell___bitmap_weighted_xor/g' \
+	-e 's/\b__bitmap_weight_andnot\b/krell___bitmap_weight_andnot/g' \
+	-e 's/\b__bitmap_weight_and\b/krell___bitmap_weight_and/g' \
+	-e 's/\b__bitmap_weight\b/krell___bitmap_weight/g' \
+	-e 's/\b__bitmap_intersects_and\b/krell___bitmap_intersects_and/g' \
+	-e 's/\b__bitmap_intersects\b/krell___bitmap_intersects/g' \
+	-e 's/\b__bitmap_shift_right\b/krell___bitmap_shift_right/g' \
+	-e 's/\b__bitmap_shift_left\b/krell___bitmap_shift_left/g' \
+	-e 's/\b__bitmap_complement\b/krell___bitmap_complement/g' \
+	-e 's/\b__bitmap_or_equal\b/krell___bitmap_or_equal/g' \
+	-e 's/\b__bitmap_equal\b/krell___bitmap_equal/g' \
+	-e 's/\b__bitmap_andnot\b/krell___bitmap_andnot/g' \
+	-e 's/\b__bitmap_and\b/krell___bitmap_and/g' \
+	-e 's/\b__bitmap_or\b/krell___bitmap_or/g' \
+	-e 's/\b__bitmap_xor\b/krell___bitmap_xor/g' \
+	-e 's/\b__bitmap_replace\b/krell___bitmap_replace/g' \
+	-e 's/\b__bitmap_subset\b/krell___bitmap_subset/g' \
+	-e 's/\b__bitmap_set\b/krell___bitmap_set/g' \
+	-e 's/\b__bitmap_clear\b/krell___bitmap_clear/g' \
+	-e 's/\bbitmap_find_next_zero_area_off\b/krell_bitmap_find_next_zero_area_off/g' \
+	-e 's/\bbitmap_cut\b/krell_bitmap_cut/g' \
+	-e 's/\bbitmap_remap\b/krell_bitmap_remap/g' \
+	-e 's/\bbitmap_bitremap\b/krell_bitmap_bitremap/g' \
+	-e 's/\bbitmap_onto\b/krell_bitmap_onto/g' \
+	-e 's/\bbitmap_fold\b/krell_bitmap_fold/g' \
+	-e 's/\bbitmap_alloc_node\b/krell_bitmap_alloc_node/g' \
+	-e 's/\bbitmap_zalloc_node\b/krell_bitmap_zalloc_node/g' \
+	-e 's/\bbitmap_alloc\b/krell_bitmap_alloc/g' \
+	-e 's/\bbitmap_zalloc\b/krell_bitmap_zalloc/g' \
+	-e 's/\bbitmap_free\b/krell_bitmap_free/g' \
+	-e 's/\bbitmap_from_arr32\b/krell_bitmap_from_arr32/g' \
+	-e 's/\bbitmap_to_arr32\b/krell_bitmap_to_arr32/g' \
+	-e 's/\bbitmap_parselist_user\b/krell_bitmap_parselist_user/g' \
+	-e 's/\bbitmap_parse_user\b/krell_bitmap_parse_user/g' \
+	-e 's/\bbitmap_parselist\b/krell_bitmap_parselist/g' \
+	-e 's/\bbitmap_parse\b/krell_bitmap_parse/g' \
+	-e 's/\bbitmap_print_bitmask_to_buf\b/krell_bitmap_print_bitmask_to_buf/g' \
+	-e 's/\bbitmap_print_list_to_buf\b/krell_bitmap_print_list_to_buf/g'
 
 $(obj)/%_krell.krel: $(src)/%.krell FORCE
 	$(Q)$(KRELLC) parse $< -o $@

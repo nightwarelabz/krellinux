@@ -47,10 +47,10 @@ readers.
   bounded fragment superoptimizer
 - Backends: x86_64, AArch64, RISC-V 64, and an LLVM lane
 
-On the twelve KRELLPROOF kernels, Krell v2.2 compiles code measured at
-1.66× the speed of C -O2 (native x86_64) and 1.58× (LLVM lane) —
+On the twelve KRELLPROOF kernels, Krell v3.0 compiles code measured at
+1.81× the speed of C -O2 (native x86_64) and 1.59× (LLVM lane) —
 geometric mean, Fibonacci excluded. Full record:
-[Krell v2.2 release](https://github.com/nightwarelabz/krell/releases/tag/v2.2).
+[Krell v3.0 release](https://github.com/nightwarelabz/krell/releases/tag/v3.0).
 
 Krell is licensed under Apache-2.0, with the Krell Encoding Exception:
 Krell-encoded programs are not derivative works and carry no license

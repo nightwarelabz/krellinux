@@ -1,0 +1,615 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; lib/bitmap-str.c converted to Krell (Phase 1 batch 5).
+;
+; Notes:
+; - Error pointers (ERR_PTR / IS_ERR / PTR_ERR) go through
+;   the alloca type-punning bridge: klbs_errptr materializes
+;   a small negative integer as a pointer, klbs_ptrval reads
+;   a pointer back as an integer.
+; - The C file's file-local struct region is passed by
+;   pointer in C; here its four mutable fields (start, off,
+;   group_len, end) live in four 8-byte slots owned by
+;   bitmap_parselist, and the helpers take the slots (or the
+;   loaded values).  nbits travels by value.
+; - bitmap_getnum calls _parse_integer(), which is
+;   _parse_integer_limit(s, base, res, INT_MAX, 0) from
+;   lib/kstrtox.c (converted in batch 4).
+; - isspace() is the kernel _ctype _S set on the unsigned
+;   char: { 9, 10, 11, 12, 13, 32, 160 }.
+; - The print helpers call the variadic kasprintf() with
+;   its fixed argument prefix (GFP_KERNEL = 0xcc0); the
+;   format strings are the module's data blobs.
+; - bitmap_clear / bitmap_set in the C text are the
+;   inlines over __bitmap_clear / __bitmap_set
+;   (lib/bitmap.krell).
+
+data klbs_fmtl: i8 = { 37, 42, 112, 98, 108, 10, 0 }
+data klbs_fmth: i8 = { 37, 42, 112, 98, 10, 0 }
+data klbs_all: i8 = { 97, 108, 108, 0 }
+
+extern memdup_user_nul(ptr, i64) -> ptr
+extern kfree(ptr) -> void
+extern _parse_integer_limit(ptr, i32, ptr, i64, i64) -> i32
+extern strncasecmp(ptr, ptr, i64) -> i32
+extern strnchrnul(ptr, i64, i32) -> ptr
+extern hex_to_bin(i32) -> i32
+extern kasprintf(i32, ptr, i32, ptr) -> ptr
+extern memory_read_from_buffer(ptr, i64, ptr, ptr, i64) -> i64
+extern strlen(ptr) -> i64
+extern __bitmap_set(ptr, i32, i32) -> void
+extern __bitmap_clear(ptr, i32, i32) -> void
+extern _find_next_bit(ptr, i64, i64) -> i64
+
+fn klbs_ptrval(ptr) -> i64 {
+  entry(p: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    store ptr %slot, p
+    %v = load i64, %slot
+    ret %v
+}
+
+fn klbs_errptr(i64) -> ptr {
+  entry(v: i64):
+    %slot = alloca 8, 8
+    store i64 %slot, v
+    %p = load ptr, %slot
+    ret %p
+}
+
+fn klbs_iserr(ptr) -> i64 {
+  entry(p: ptr):
+    %v = call i64 klbs_ptrval(p)
+    %thr = sub i64 0, 4095
+    %c = icmp.uge i64 %v, %thr
+    %r = select i64 %c, 1, 0
+    ret %r
+}
+
+fn klbs_isspace(i64) -> i64 {
+  entry(c: i64):
+    %b = and i64 c, 255
+    %lo = icmp.uge i64 %b, 9
+    condbr %lo, chkhi(c, %b), no()
+  chkhi(c: i64, b: i64):
+    %hi = icmp.ule i64 b, 13
+    condbr %hi, yes(), chk2(b)
+  chk2(b: i64):
+    %s = icmp.eq i64 b, 32
+    condbr %s, yes(), chk3(b)
+  chk3(b: i64):
+    %n = icmp.eq i64 b, 160
+    condbr %n, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn klbs_end_of_str(i64) -> i64 {
+  entry(c: i64):
+    %b = and i64 c, 255
+    %z = icmp.eq i64 %b, 0
+    condbr %z, yes(), chk(b)
+  chk(b: i64):
+    %n = icmp.eq i64 b, 10
+    condbr %n, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+; __end_of_region: isspace(c) || c == ','
+fn klbs_eor(i64) -> i64 {
+  entry(c: i64):
+    %s = call i64 klbs_isspace(c)
+    %nz = icmp.ne i64 %s, 0
+    condbr %nz, yes(), chk(c)
+  chk(c: i64):
+    %b = and i64 c, 255
+    %cm = icmp.eq i64 %b, 44
+    condbr %cm, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn klbs_end_of_region(i64) -> i64 {
+  entry(c: i64):
+    %e = call i64 klbs_eor(c)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, yes(), chk(c)
+  chk(c: i64):
+    %s = call i64 klbs_end_of_str(c)
+    %nz2 = icmp.ne i64 %s, 0
+    condbr %nz2, yes(), no()
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn klbs_zero(ptr, i64) -> void {
+  entry(dst: ptr, nbits: i64):
+    %t = add i64 nbits, 63
+    %nr = udiv i64 %t, 64
+    br head(dst, %nr, 0)
+  head(dst: ptr, nr: i64, k: i64):
+    %c = icmp.ult i64 k, nr
+    condbr %c, body(dst, nr, k), done()
+  body(dst: ptr, nr: i64, k: i64):
+    %p = gep i64 dst, k
+    store i64 %p, 0
+    %k2 = add i64 k, 1
+    br head(dst, nr, %k2)
+  done():
+    ret
+}
+
+fn klbs_getnum(ptr, ptr, i64) -> ptr {
+  entry(str: ptr, num: ptr, lastbit: i64):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %isn = icmp.eq i64 %cz, 78
+    condbr %isn, nform(num, lastbit, str), parse(str, num)
+  nform(num: ptr, lastbit: i64, str: ptr):
+    %v = trunc i32 lastbit
+    store i32 num, %v
+    %r = gep i8 str, 1
+    ret %r
+  parse(str: ptr, num: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    %len = call i32 _parse_integer_limit(str, 10, %slot, 2147483647, 0)
+    %lz = icmp.eq i32 %len, 0
+    condbr %lz, einval(), chk(str, num, %slot, %len)
+  chk(str: ptr, num: ptr, slot: ptr, len: i32):
+    %ovf = and i32 %len, -2147483648
+    %nz = icmp.ne i32 %ovf, 0
+    condbr %nz, eoverflow(), chk2(str, num, slot, len)
+  chk2(str: ptr, num: ptr, slot: ptr, len: i32):
+    %n = load i64, slot
+    %nt = trunc i32 %n
+    %nz2 = zext i64 %nt
+    %ne = icmp.ne i64 %n, %nz2
+    condbr %ne, eoverflow(), good(str, num, %n, len)
+  good(str: ptr, num: ptr, n: i64, len: i32):
+    %v = trunc i32 n
+    store i32 num, %v
+    %lz = zext i64 len
+    %r = gep i8 str, %lz
+    ret %r
+  einval():
+    %e = sub i64 0, 22
+    %p = call ptr klbs_errptr(%e)
+    ret %p
+  eoverflow():
+    %e = sub i64 0, 75
+    %p = call ptr klbs_errptr(%e)
+    ret %p
+}
+
+fn klbs_find_region(ptr) -> ptr {
+  entry(str: ptr):
+    br head(str)
+  head(str: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %e = call i64 klbs_eor(%cz)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, next(str), tail(str)
+  next(str: ptr):
+    %s2 = gep i8 str, 1
+    br head(%s2)
+  tail(str: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %es = call i64 klbs_end_of_str(%cz)
+    %nz = icmp.ne i64 %es, 0
+    condbr %nz, null(), keep(str)
+  null():
+    %p = call ptr klbs_errptr(0)
+    ret %p
+  keep(str: ptr):
+    ret str
+}
+
+fn klbs_find_region_reverse(ptr, ptr) -> ptr {
+  entry(start: ptr, end: ptr):
+    br head(start, end)
+  head(start: ptr, end: ptr):
+    %sv = call i64 klbs_ptrval(start)
+    %ev = call i64 klbs_ptrval(end)
+    %le = icmp.ule i64 %sv, %ev
+    condbr %le, chk(start, end), done(end)
+  chk(start: ptr, end: ptr):
+    %c = load i8, end
+    %cz = zext i64 %c
+    %e = call i64 klbs_eor(%cz)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, next(start, end), done(end)
+  next(start: ptr, end: ptr):
+    %e2 = gep i8 end, -1
+    br head(start, %e2)
+  done(end: ptr):
+    ret end
+}
+
+fn klbs_parse_region(ptr, i64, ptr, ptr, ptr, ptr) -> ptr {
+  entry(str: ptr, nbits: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %nb32 = trunc i32 nbits
+    %lb32 = sub i32 %nb32, 1
+    %lastbit = zext i64 %lb32
+    %all = dataptr 2
+    %cmp = call i32 strncasecmp(str, %all, 3)
+    %z = icmp.eq i32 %cmp, 0
+    condbr %z, allform(str, %lastbit, ps, po, pg, pe), numform(str, %lastbit, ps, po, pg, pe)
+  allform(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    store i32 ps, 0
+    %e = trunc i32 lastbit
+    store i32 pe, %e
+    %s2 = gep i8 str, 3
+    br pattern(%s2, lastbit, ps, po, pg, pe)
+  numform(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %r = call ptr klbs_getnum(str, ps, lastbit)
+    %ie = call i64 klbs_iserr(%r)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, retp(%r), have(%r, lastbit, ps, po, pg, pe)
+  have(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %e = call i64 klbs_end_of_region(%cz)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, noend(str, ps, po, pg, pe), dash(str, lastbit, ps, po, pg, pe)
+  dash(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %isd = icmp.eq i64 %cz, 45
+    condbr %isd, getend(str, lastbit, ps, po, pg, pe), einval()
+  getend(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %s1 = gep i8 str, 1
+    %r = call ptr klbs_getnum(%s1, pe, lastbit)
+    %ie = call i64 klbs_iserr(%r)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, retp(%r), pattern(%r, lastbit, ps, po, pg, pe)
+  pattern(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %e = call i64 klbs_end_of_region(%cz)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, nopattern(str, pe, po, pg), colon(str, lastbit, ps, po, pg, pe)
+  colon(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %isc = icmp.eq i64 %cz, 58
+    condbr %isc, getoff(str, lastbit, ps, po, pg, pe), einval()
+  getoff(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %s1 = gep i8 str, 1
+    %r = call ptr klbs_getnum(%s1, po, lastbit)
+    %ie = call i64 klbs_iserr(%r)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, retp(%r), slash(%r, lastbit, ps, po, pg, pe)
+  slash(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %iss = icmp.eq i64 %cz, 47
+    condbr %iss, getgrp(str, lastbit, ps, po, pg, pe), einval()
+  getgrp(str: ptr, lastbit: i64, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %s1 = gep i8 str, 1
+    %r = call ptr klbs_getnum(%s1, pg, lastbit)
+    %ie = call i64 klbs_iserr(%r)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, retp(%r), tailchk(%r)
+  tailchk(str: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %e = call i64 klbs_end_of_region(%cz)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, fin(str), einval()
+  fin(str: ptr):
+    %c = load i8, str
+    %cz = zext i64 %c
+    %es = call i64 klbs_end_of_str(%cz)
+    %nz = icmp.ne i64 %es, 0
+    condbr %nz, null(), keep(str)
+  noend(str: ptr, ps: ptr, po: ptr, pg: ptr, pe: ptr):
+    %s = load i32, ps
+    store i32 pe, %s
+    br nopattern(str, pe, po, pg)
+  nopattern(str: ptr, pe: ptr, po: ptr, pg: ptr):
+    %e = load i32, pe
+    %e1 = add i32 %e, 1
+    store i32 po, %e1
+    store i32 pg, %e1
+    br fin(str)
+  null():
+    %p = call ptr klbs_errptr(0)
+    ret %p
+  keep(str: ptr):
+    ret str
+  retp(p: ptr):
+    ret p
+  einval():
+    %e = sub i64 0, 22
+    %p = call ptr klbs_errptr(%e)
+    ret %p
+}
+
+fn klbs_check_region(i64, i64, i64, i64, i64) -> i64 {
+  entry(start: i64, off: i64, grp: i64, end: i64, nbits: i64):
+    %gt = icmp.ugt i64 start, end
+    condbr %gt, einval(), chk1(off, grp, end, nbits)
+  chk1(off: i64, grp: i64, end: i64, nbits: i64):
+    %gz = icmp.eq i64 grp, 0
+    condbr %gz, einval(), chk2(off, grp, end, nbits)
+  chk2(off: i64, grp: i64, end: i64, nbits: i64):
+    %og = icmp.ugt i64 off, grp
+    condbr %og, einval(), chk3(end, nbits)
+  chk3(end: i64, nbits: i64):
+    %ge = icmp.uge i64 end, nbits
+    condbr %ge, erange(), ok()
+  ok():
+    ret 0
+  einval():
+    %r = sub i64 0, 22
+    ret %r
+  erange():
+    %r = sub i64 0, 34
+    ret %r
+}
+
+fn klbs_set_region(i64, i64, i64, i64, ptr) -> void {
+  entry(start: i64, off: i64, grp: i64, end: i64, bm: ptr):
+    br body(start, off, grp, end, bm)
+  body(start: i64, off: i64, grp: i64, end: i64, bm: ptr):
+    %span = sub i64 end, start
+    %span1 = add i64 %span, 1
+    %lt = icmp.ult i64 %span1, off
+    %m = select i64 %lt, %span1, off
+    %s32 = trunc i32 start
+    %m32 = trunc i32 %m
+    call void __bitmap_set(bm, %s32, %m32)
+    %sum = add i64 start, grp
+    %ovf = icmp.ugt i64 %sum, 4294967295
+    condbr %ovf, done(), chk(%sum, off, grp, end, bm)
+  chk(sum: i64, off: i64, grp: i64, end: i64, bm: ptr):
+    %le = icmp.ule i64 sum, end
+    condbr %le, body(sum, off, grp, end, bm), done()
+  done():
+    ret
+}
+
+fn bitmap_parselist(ptr, ptr, i32) -> i32 {
+  entry(buf: ptr, maskp: ptr, nb32: i32):
+    %nbits = zext i64 nb32
+    call void klbs_zero(maskp, %nbits)
+    %ss = alloca 8, 8
+    %so = alloca 8, 8
+    %sg = alloca 8, 8
+    %se = alloca 8, 8
+    store i64 %ss, 0
+    store i64 %so, 0
+    store i64 %sg, 0
+    store i64 %se, 0
+    br head(buf, maskp, %nbits, %ss, %so, %sg, %se)
+  head(buf: ptr, maskp: ptr, nbits: i64, ss: ptr, so: ptr, sg: ptr, se: ptr):
+    %bv = call i64 klbs_ptrval(buf)
+    %bz = icmp.eq i64 %bv, 0
+    condbr %bz, ok(), find(buf, maskp, nbits, ss, so, sg, se)
+  find(buf: ptr, maskp: ptr, nbits: i64, ss: ptr, so: ptr, sg: ptr, se: ptr):
+    %r = call ptr klbs_find_region(buf)
+    %v = call i64 klbs_ptrval(%r)
+    %z = icmp.eq i64 %v, 0
+    condbr %z, ok(), parse(%r, maskp, nbits, ss, so, sg, se)
+  parse(buf: ptr, maskp: ptr, nbits: i64, ss: ptr, so: ptr, sg: ptr, se: ptr):
+    %r = call ptr klbs_parse_region(buf, nbits, ss, so, sg, se)
+    %ie = call i64 klbs_iserr(%r)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, err(%r), check(%r, maskp, nbits, ss, so, sg, se)
+  check(buf: ptr, maskp: ptr, nbits: i64, ss: ptr, so: ptr, sg: ptr, se: ptr):
+    %s = load i32, ss
+    %sz = zext i64 %s
+    %o = load i32, so
+    %oz = zext i64 %o
+    %g = load i32, sg
+    %gz = zext i64 %g
+    %e = load i32, se
+    %ez = zext i64 %e
+    %ret = call i64 klbs_check_region(%sz, %oz, %gz, %ez, nbits)
+    %nz = icmp.ne i64 %ret, 0
+    condbr %nz, errv(%ret), apply(buf, maskp, nbits, ss, so, sg, se, %sz, %oz, %gz, %ez)
+  apply(buf: ptr, maskp: ptr, nbits: i64, ss: ptr, so: ptr, sg: ptr, se: ptr, s: i64, o: i64, g: i64, e: i64):
+    call void klbs_set_region(s, o, g, e, maskp)
+    br head(buf, maskp, nbits, ss, so, sg, se)
+  err(p: ptr):
+    %v = call i64 klbs_ptrval(p)
+    %r = trunc i32 %v
+    ret %r
+  errv(v: i64):
+    %r = trunc i32 v
+    ret %r
+  ok():
+    ret 0
+}
+
+fn bitmap_parselist_user(ptr, i32, ptr, i32) -> i32 {
+  entry(ubuf: ptr, ulen32: i32, maskp: ptr, nb32: i32):
+    %ulen = zext i64 ulen32
+    %buf = call ptr memdup_user_nul(ubuf, %ulen)
+    %ie = call i64 klbs_iserr(%buf)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, err(%buf), go(%buf, maskp, nb32)
+  go(buf: ptr, maskp: ptr, nb32: i32):
+    %ret = call i32 bitmap_parselist(buf, maskp, nb32)
+    call void kfree(buf)
+    ret %ret
+  err(p: ptr):
+    %v = call i64 klbs_ptrval(p)
+    %r = trunc i32 %v
+    ret %r
+}
+
+fn bitmap_parse_user(ptr, i32, ptr, i32) -> i32 {
+  entry(ubuf: ptr, ulen32: i32, maskp: ptr, nb32: i32):
+    %ulen = zext i64 ulen32
+    %buf = call ptr memdup_user_nul(ubuf, %ulen)
+    %ie = call i64 klbs_iserr(%buf)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, err(%buf), go(%buf, maskp, nb32)
+  go(buf: ptr, maskp: ptr, nb32: i32):
+    %um = sub i32 0, 1
+    %ret = call i32 bitmap_parse(buf, %um, maskp, nb32)
+    call void kfree(buf)
+    ret %ret
+  err(p: ptr):
+    %v = call i64 klbs_ptrval(p)
+    %r = trunc i32 %v
+    ret %r
+}
+
+fn klbs_get_x32_reverse(ptr, ptr, ptr) -> ptr {
+  entry(start: ptr, end: ptr, num: ptr):
+    br loop(start, end, num, 0, 0)
+  loop(start: ptr, end: ptr, num: ptr, ret32: i32, i: i64):
+    %c8 = load i8, end
+    %cz = zext i64 %c8
+    %ct = trunc i32 %cz
+    %c = call i32 hex_to_bin(%ct)
+    %neg = icmp.slt i32 %c, 0
+    condbr %neg, einval(), use(start, end, num, ret32, i, %c)
+  use(start: ptr, end: ptr, num: ptr, ret32: i32, i: i64, c: i32):
+    %sh = trunc i32 i
+    %cv = shl i32 c, %sh
+    %r2 = or i32 ret32, %cv
+    %e2 = gep i8 end, -1
+    %sv = call i64 klbs_ptrval(start)
+    %ev = call i64 klbs_ptrval(%e2)
+    %gt = icmp.ugt i64 %sv, %ev
+    condbr %gt, out(num, %r2, %e2), chksep(start, %e2, num, %r2, i)
+  chksep(start: ptr, end: ptr, num: ptr, ret32: i32, i: i64):
+    %c8 = load i8, end
+    %cz = zext i64 %c8
+    %e = call i64 klbs_eor(%cz)
+    %nz = icmp.ne i64 %e, 0
+    condbr %nz, out(num, ret32, end), next(start, end, num, ret32, i)
+  next(start: ptr, end: ptr, num: ptr, ret32: i32, i: i64):
+    %i2 = add i64 i, 4
+    %done = icmp.eq i64 %i2, 32
+    condbr %done, over(start, end), loop(start, end, num, ret32, %i2)
+  over(start: ptr, end: ptr):
+    %c8 = load i8, end
+    %cz = zext i64 %c8
+    %ct = trunc i32 %cz
+    %c = call i32 hex_to_bin(%ct)
+    %neg = icmp.slt i32 %c, 0
+    condbr %neg, einval(), eoverflow()
+  out(num: ptr, ret32: i32, end: ptr):
+    store i32 num, ret32
+    ret end
+  einval():
+    %e = sub i64 0, 22
+    %p = call ptr klbs_errptr(%e)
+    ret %p
+  eoverflow():
+    %e = sub i64 0, 75
+    %p = call ptr klbs_errptr(%e)
+    ret %p
+}
+
+fn bitmap_parse(ptr, i32, ptr, i32) -> i32 {
+  entry(start: ptr, buflen32: i32, maskp: ptr, nb32: i32):
+    %buflen = zext i64 buflen32
+    %nl = call ptr strnchrnul(start, %buflen, 10)
+    %end0 = gep i8 %nl, -1
+    %nbits = zext i64 nb32
+    %t = add i64 %nbits, 31
+    %chunks0 = udiv i64 %t, 32
+    br head(start, %end0, maskp, nb32, %nbits, %chunks0, %chunks0, 0)
+  head(start: ptr, end: ptr, maskp: ptr, nb32: i32, nbits: i64, chunks: i64, total: i64, chunk: i64):
+    %e2 = call ptr klbs_find_region_reverse(start, end)
+    %sv = call i64 klbs_ptrval(start)
+    %ev = call i64 klbs_ptrval(%e2)
+    %gt = icmp.ugt i64 %sv, %ev
+    condbr %gt, fin(maskp, nb32, nbits, chunks, total), step(start, %e2, maskp, nb32, nbits, chunks, total, chunk)
+  step(start: ptr, end: ptr, maskp: ptr, nb32: i32, nbits: i64, chunks: i64, total: i64, chunk: i64):
+    %cz = icmp.eq i64 chunks, 0
+    condbr %cz, eoverflow(), take(start, end, maskp, nb32, nbits, chunks, total, chunk)
+  take(start: ptr, end: ptr, maskp: ptr, nb32: i32, nbits: i64, chunks: i64, total: i64, chunk: i64):
+    %ch2 = sub i64 chunks, 1
+    %tgt = gep i32 maskp, chunk
+    %e3 = call ptr klbs_get_x32_reverse(start, end, %tgt)
+    %ie = call i64 klbs_iserr(%e3)
+    %nz = icmp.ne i64 %ie, 0
+    condbr %nz, err(%e3), again(start, %e3, maskp, nb32, nbits, %ch2, total, chunk)
+  again(start: ptr, end: ptr, maskp: ptr, nb32: i32, nbits: i64, chunks: i64, total: i64, chunk: i64):
+    %c2 = add i64 chunk, 1
+    br head(start, end, maskp, nb32, nbits, chunks, total, %c2)
+  fin(maskp: ptr, nb32: i32, nbits: i64, chunks: i64, total: i64):
+    %used = sub i64 total, chunks
+    %unset = shl i64 %used, 5
+    %lt = icmp.slt i64 %unset, nbits
+    condbr %lt, clear(maskp, nb32, nbits, %unset), verify(maskp, nbits, %unset)
+  clear(maskp: ptr, nb32: i32, nbits: i64, unset: i64):
+    %u32 = trunc i32 unset
+    %rest = sub i64 nbits, unset
+    %r32 = trunc i32 %rest
+    call void __bitmap_clear(maskp, %u32, %r32)
+    ret 0
+  verify(maskp: ptr, nbits: i64, unset: i64):
+    %r = call i64 _find_next_bit(maskp, unset, nbits)
+    %ne = icmp.ne i64 %r, unset
+    condbr %ne, eoverflow(), ok()
+  ok():
+    ret 0
+  err(p: ptr):
+    %v = call i64 klbs_ptrval(p)
+    %r = trunc i32 %v
+    ret %r
+  eoverflow():
+    %r = sub i32 0, 75
+    ret %r
+}
+
+fn klbs_print_to_buf(i64, ptr, ptr, i32, i64, i64) -> i64 {
+  entry(list: i64, buf: ptr, maskp: ptr, nb32: i32, off: i64, count: i64):
+    %lz = icmp.ne i64 list, 0
+    condbr %lz, fl(), fh()
+  fl():
+    %f = dataptr 0
+    br have(buf, maskp, nb32, off, count, %f)
+  fh():
+    %f = dataptr 1
+    br have(buf, maskp, nb32, off, count, %f)
+  have(buf: ptr, maskp: ptr, nb32: i32, off: i64, count: i64, fmt: ptr):
+    %data = call ptr kasprintf(3264, fmt, nb32, maskp)
+    %v = call i64 klbs_ptrval(%data)
+    %z = icmp.eq i64 %v, 0
+    condbr %z, enomem(), go(buf, %data, off, count)
+  go(buf: ptr, data: ptr, off: i64, count: i64):
+    %slot = alloca 8, 8
+    store i64 %slot, off
+    %len = call i64 strlen(data)
+    %len1 = add i64 %len, 1
+    %size = call i64 memory_read_from_buffer(buf, count, %slot, data, %len1)
+    call void kfree(data)
+    ret %size
+  enomem():
+    %r = sub i64 0, 12
+    ret %r
+}
+
+fn bitmap_print_bitmask_to_buf(ptr, ptr, i32, i64, i64) -> i32 {
+  entry(buf: ptr, maskp: ptr, nb32: i32, off: i64, count: i64):
+    %r = call i64 klbs_print_to_buf(0, buf, maskp, nb32, off, count)
+    %t = trunc i32 %r
+    ret %t
+}
+
+fn bitmap_print_list_to_buf(ptr, ptr, i32, i64, i64) -> i32 {
+  entry(buf: ptr, maskp: ptr, nb32: i32, off: i64, count: i64):
+    %r = call i64 klbs_print_to_buf(1, buf, maskp, nb32, off, count)
+    %t = trunc i32 %r
+    ret %t
+}

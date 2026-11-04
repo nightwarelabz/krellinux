@@ -357,9 +357,10 @@ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
 # conversion is proven against its C original by the differential rig
 # in tools/converge/rig/ before it is recorded in CONVERSION.md.
 KRELLC ?= krellc
-obj-y += krell_phase1_check.o \
+obj-y += krell_phase1_check.o krell_string_check.o \
 	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
-	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o
+	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o \
+	 string_krell.o
 
 krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
@@ -368,7 +369,40 @@ krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ucmpdi2\b/krell___ucmpdi2/g' \
 	-e 's/\b_bcd2bin\b/krell__bcd2bin/g' \
 	-e 's/\b_bin2bcd\b/krell__bin2bcd/g' \
-	-e 's/\b__muldi3\b/krell___muldi3/g'
+	-e 's/\b__muldi3\b/krell___muldi3/g' \
+	-e 's/\bstrncasecmp\b/krell_strncasecmp/g' \
+	-e 's/\bstrcasecmp\b/krell_strcasecmp/g' \
+	-e 's/\bstrcpy\b/krell_strcpy/g' \
+	-e 's/\bsized_strscpy\b/krell_sized_strscpy/g' \
+	-e 's/\bstpcpy\b/krell_stpcpy/g' \
+	-e 's/\bstrcat\b/krell_strcat/g' \
+	-e 's/\bstrncat\b/krell_strncat/g' \
+	-e 's/\bstrcmp\b/krell_strcmp/g' \
+	-e 's/\bstrncmp\b/krell_strncmp/g' \
+	-e 's/\bstrchr\b/krell_strchr/g' \
+	-e 's/\bstrchrnul\b/krell_strchrnul/g' \
+	-e 's/\bstrnchrnul\b/krell_strnchrnul/g' \
+	-e 's/\bstrrchr\b/krell_strrchr/g' \
+	-e 's/\bstrnchr\b/krell_strnchr/g' \
+	-e 's/\bstrlen\b/krell_strlen/g' \
+	-e 's/\bstrnlen\b/krell_strnlen/g' \
+	-e 's/\bstrspn\b/krell_strspn/g' \
+	-e 's/\bstrcspn\b/krell_strcspn/g' \
+	-e 's/\bstrpbrk\b/krell_strpbrk/g' \
+	-e 's/\bstrsep\b/krell_strsep/g' \
+	-e 's/\bmemset\b/krell_memset/g' \
+	-e 's/\bmemset16\b/krell_memset16/g' \
+	-e 's/\bmemset32\b/krell_memset32/g' \
+	-e 's/\bmemset64\b/krell_memset64/g' \
+	-e 's/\bmemcpy\b/krell_memcpy/g' \
+	-e 's/\bmemmove\b/krell_memmove/g' \
+	-e 's/\bmemcmp\b/krell_memcmp/g' \
+	-e 's/\bbcmp\b/krell_bcmp/g' \
+	-e 's/\bmemscan\b/krell_memscan/g' \
+	-e 's/\bstrstr\b/krell_strstr/g' \
+	-e 's/\bstrnstr\b/krell_strnstr/g' \
+	-e 's/\bmemchr\b/krell_memchr/g' \
+	-e 's/\bmemchr_inv\b/krell_memchr_inv/g'
 
 $(obj)/%_krell.krel: $(src)/%.krell FORCE
 	$(Q)$(KRELLC) parse $< -o $@

@@ -1,0 +1,227 @@
+# Convergence census -- lib/
+
+Files scanned: 212. Classes: ASSIST 104, AUTO 83, RESIDUE 25.
+
+## What blocks conversion (files affected)
+
+- inline asm: 76
+- indirect calls / function pointers: 64
+- atomics beyond load/store/add: 33
+- volatile: 14
+- varargs: 8
+- bitfields: 1
+
+## Per file
+
+- `lib/argv_split.c` -- AUTO
+- `lib/ashldi3.c` -- AUTO
+- `lib/ashrdi3.c` -- AUTO
+- `lib/asn1_decoder.c` -- ASSIST -- indirect calls / function pointers
+- `lib/asn1_encoder.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/assoc_array.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/atomic64.c` -- AUTO
+- `lib/atomic64_test.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/audit.c` -- AUTO
+- `lib/base64.c` -- AUTO
+- `lib/bcd.c` -- AUTO
+- `lib/bch.c` -- ASSIST -- inline asm
+- `lib/bitmap-str.c` -- AUTO
+- `lib/bitmap.c` -- AUTO
+- `lib/bitrev.c` -- AUTO
+- `lib/bootconfig.c` -- ASSIST -- inline asm
+- `lib/bsearch.c` -- AUTO
+- `lib/btree.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/bucket_locks.c` -- AUTO
+- `lib/bug.c` -- ASSIST -- varargs
+- `lib/buildid.c` -- ASSIST -- inline asm
+- `lib/bust_spinlocks.c` -- AUTO
+- `lib/cache_maint.c` -- ASSIST -- indirect calls / function pointers
+- `lib/check_signature.c` -- ASSIST -- volatile
+- `lib/checksum.c` -- AUTO
+- `lib/closure.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/clz_ctz.c` -- AUTO
+- `lib/clz_tab.c` -- AUTO
+- `lib/cmdline.c` -- AUTO
+- `lib/cmpdi2.c` -- AUTO
+- `lib/cmpxchg-emu.c` -- ASSIST -- atomics beyond load/store/add; volatile; inline asm
+- `lib/codetag.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/compat_audit.c` -- RESIDUE -- clang parse error: 'asm/unistd32.h' file not found
+- `lib/cpu_rmap.c` -- AUTO
+- `lib/cpumask.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/ctype.c` -- AUTO
+- `lib/debug_info.c` -- AUTO
+- `lib/debug_locks.c` -- AUTO
+- `lib/debugobjects.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm
+- `lib/dec_and_lock.c` -- ASSIST -- atomics beyond load/store/add
+- `lib/decompress.c` -- AUTO
+- `lib/decompress_bunzip2.c` -- ASSIST -- indirect calls / function pointers
+- `lib/decompress_inflate.c` -- ASSIST -- indirect calls / function pointers
+- `lib/decompress_unlz4.c` -- ASSIST -- indirect calls / function pointers
+- `lib/decompress_unlzma.c` -- ASSIST -- indirect calls / function pointers
+- `lib/decompress_unlzo.c` -- ASSIST -- indirect calls / function pointers
+- `lib/decompress_unxz.c` -- ASSIST -- indirect calls / function pointers
+- `lib/decompress_unzstd.c` -- ASSIST -- indirect calls / function pointers
+- `lib/devmem_is_allowed.c` -- AUTO
+- `lib/devres.c` -- ASSIST -- inline asm
+- `lib/dhry_1.c` -- AUTO
+- `lib/dhry_2.c` -- AUTO
+- `lib/dhry_run.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/digsig.c` -- AUTO
+- `lib/dump_stack.c` -- ASSIST -- atomics beyond load/store/add; varargs
+- `lib/dynamic_debug.c` -- ASSIST -- indirect calls / function pointers; varargs; bitfields; inline asm
+- `lib/dynamic_queue_limits.c` -- ASSIST -- inline asm
+- `lib/earlycpio.c` -- AUTO
+- `lib/errname.c` -- AUTO
+- `lib/error-inject.c` -- ASSIST -- indirect calls / function pointers
+- `lib/errseq.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm
+- `lib/extable.c` -- AUTO
+- `lib/fault-inject-usercopy.c` -- AUTO
+- `lib/fault-inject.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/fdt.c` -- AUTO
+- `lib/fdt_addresses.c` -- AUTO
+- `lib/fdt_empty_tree.c` -- AUTO
+- `lib/fdt_ro.c` -- AUTO
+- `lib/fdt_rw.c` -- AUTO
+- `lib/fdt_strerror.c` -- AUTO
+- `lib/fdt_sw.c` -- AUTO
+- `lib/fdt_wip.c` -- AUTO
+- `lib/find_bit.c` -- AUTO
+- `lib/find_bit_benchmark.c` -- ASSIST -- inline asm
+- `lib/flex_proportions.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/fw_table.c` -- ASSIST -- indirect calls / function pointers
+- `lib/genalloc.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm
+- `lib/generic-radix-tree.c` -- ASSIST -- atomics beyond load/store/add; volatile; inline asm
+- `lib/glob.c` -- AUTO
+- `lib/group_cpus.c` -- ASSIST -- inline asm
+- `lib/hexdump.c` -- AUTO
+- `lib/hweight.c` -- AUTO
+- `lib/idr.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/inflate.c` -- RESIDUE -- clang parse error: 'gzip.h' file not found
+- `lib/interval_tree.c` -- AUTO
+- `lib/interval_tree_test.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/iomap.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/iomap_copy.c` -- AUTO
+- `lib/iomem_copy.c` -- AUTO
+- `lib/iommu-helper.c` -- AUTO
+- `lib/iov_iter.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/irq_poll.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/irq_regs.c` -- AUTO
+- `lib/is_single_threaded.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/kasprintf.c` -- ASSIST -- indirect calls / function pointers; varargs; inline asm
+- `lib/kfifo.c` -- ASSIST -- inline asm
+- `lib/klist.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/kobject.c` -- ASSIST -- indirect calls / function pointers; varargs; inline asm
+- `lib/kobject_uevent.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; varargs; inline asm
+- `lib/kstrtox.c` -- AUTO
+- `lib/linear_ranges.c` -- AUTO
+- `lib/list_debug.c` -- AUTO
+- `lib/list_sort.c` -- AUTO
+- `lib/llist.c` -- ASSIST -- atomics beyond load/store/add; volatile; inline asm
+- `lib/locking-selftest.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/lockref.c` -- ASSIST -- atomics beyond load/store/add; volatile; inline asm
+- `lib/logic_iomem.c` -- ASSIST -- indirect calls / function pointers; volatile; inline asm
+- `lib/logic_pio.c` -- AUTO
+- `lib/lru_cache.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm
+- `lib/lshrdi3.c` -- AUTO
+- `lib/lwq.c` -- ASSIST -- inline asm
+- `lib/maple_tree.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/memcat_p.c` -- AUTO
+- `lib/memory-notifier-error-inject.c` -- AUTO
+- `lib/memregion.c` -- AUTO
+- `lib/memweight.c` -- ASSIST -- inline asm
+- `lib/min_heap.c` -- AUTO
+- `lib/muldi3.c` -- AUTO
+- `lib/net_utils.c` -- AUTO
+- `lib/netdev-notifier-error-inject.c` -- AUTO
+- `lib/nlattr.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/nmi_backtrace.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/notifier-error-inject.c` -- ASSIST -- indirect calls / function pointers
+- `lib/objagg.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/objpool.c` -- ASSIST -- indirect calls / function pointers
+- `lib/of-reconfig-notifier-error-inject.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/oid_registry.c` -- AUTO
+- `lib/oid_registry_data.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/once.c` -- ASSIST -- inline asm
+- `lib/packing.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/packing_test.c` -- ASSIST -- indirect calls / function pointers
+- `lib/parman.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/parser.c` -- AUTO
+- `lib/percpu-refcount.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/percpu_counter.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/percpu_test.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm
+- `lib/plist.c` -- ASSIST -- inline asm
+- `lib/pm-notifier-error-inject.c` -- AUTO
+- `lib/radix-tree.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/random32.c` -- AUTO
+- `lib/ratelimit.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/rbtree.c` -- ASSIST -- indirect calls / function pointers
+- `lib/rbtree_test.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/rcuref.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/ref_tracker.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/refcount.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/region_alloc_benchmark.c` -- ASSIST -- inline asm
+- `lib/rhashtable.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm
+- `lib/sbitmap.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/scatterlist.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/seq_buf.c` -- ASSIST -- varargs; inline asm
+- `lib/sg_pool.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/sg_split.c` -- AUTO
+- `lib/smp_processor_id.c` -- ASSIST -- inline asm
+- `lib/sort.c` -- ASSIST -- indirect calls / function pointers
+- `lib/stackdepot.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/stmp_device.c` -- AUTO
+- `lib/string.c` -- ASSIST -- inline asm
+- `lib/string_helpers.c` -- ASSIST -- inline asm
+- `lib/strncpy_from_user.c` -- ASSIST -- inline asm
+- `lib/strnlen_user.c` -- ASSIST -- inline asm
+- `lib/sys_info.c` -- AUTO
+- `lib/syscall.c` -- AUTO
+- `lib/test-kstrtox.c` -- ASSIST -- indirect calls / function pointers; inline asm
+- `lib/test_bitmap.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_bitops.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_context-analysis.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/test_csd_lock.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_debug_virtual.c` -- AUTO
+- `lib/test_dynamic_debug.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_firmware.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_fpu_glue.c` -- AUTO
+- `lib/test_fpu_impl.c` -- ASSIST -- volatile
+- `lib/test_free_pages.c` -- AUTO
+- `lib/test_hexdump.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_hmm.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_ida.c` -- AUTO
+- `lib/test_kho.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_kmod.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_lockup.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_maple_tree.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/test_memcat_p.c` -- AUTO
+- `lib/test_meminit.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_module.c` -- AUTO
+- `lib/test_objagg.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_objpool.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/test_parman.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_ref_tracker.c` -- ASSIST -- atomics beyond load/store/add
+- `lib/test_rhashtable.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_static_key_base.c` -- AUTO
+- `lib/test_static_keys.c` -- ASSIST -- indirect calls / function pointers
+- `lib/test_sysctl.c` -- ASSIST -- indirect calls / function pointers
+- `lib/test_ubsan.c` -- ASSIST -- indirect calls / function pointers; volatile; inline asm
+- `lib/test_vmalloc.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_workqueue.c` -- RESIDUE -- clang parse error: too many errors emitted, stopping now
+- `lib/test_xarray.c` -- ASSIST -- atomics beyond load/store/add; inline asm
+- `lib/textsearch.c` -- ASSIST -- indirect calls / function pointers
+- `lib/timerqueue.c` -- ASSIST -- inline asm
+- `lib/trace_readwrite.c` -- AUTO
+- `lib/ts_bm.c` -- ASSIST -- indirect calls / function pointers
+- `lib/ts_fsm.c` -- ASSIST -- indirect calls / function pointers
+- `lib/ts_kmp.c` -- ASSIST -- indirect calls / function pointers
+- `lib/ubsan.c` -- ASSIST -- inline asm
+- `lib/ucmpdi2.c` -- AUTO
+- `lib/ucs2_string.c` -- AUTO
+- `lib/union_find.c` -- AUTO
+- `lib/usercopy.c` -- ASSIST -- inline asm
+- `lib/uuid.c` -- AUTO
+- `lib/vsprintf.c` -- ASSIST -- indirect calls / function pointers; varargs; inline asm
+- `lib/win_minmax.c` -- AUTO
+- `lib/xarray.c` -- ASSIST -- indirect calls / function pointers; atomics beyond load/store/add; inline asm
+- `lib/xxhash.c` -- AUTO

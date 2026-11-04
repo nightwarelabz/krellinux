@@ -69,3 +69,19 @@ $(obj)/crc32table.h: $(obj)/gen_crc32table
 
 $(obj)/crc64table.h: $(obj)/gen_crc64table
 	$(call cmd,crc64)
+
+# Krellinux Phase 0 spike: build lib/crc/crc16.krell through krellc and
+# link it as crc16_krell.o; krell_spike.o self-checks it at boot.
+# KRELLC must name a krellc binary; KRELL_TARGETS its targets/ dir.
+KRELLC ?= krellc
+obj-y += krell_spike.o crc16_krell.o
+
+$(obj)/crc16_krell.krel: $(src)/crc16.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/crc16_krell.s: $(obj)/crc16_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+		sed 's/\bcrc16\b/krell_crc16/g' $@.tmp > $@ && rm $@.tmp
+
+$(obj)/crc16_krell.o: $(obj)/crc16_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<

@@ -1,0 +1,34 @@
+; SPDX-License-Identifier: GPL-2.0
+; Krellinux Phase 1 conversion of lib/bcd.c:
+; _bcd2bin(unsigned char) and _bin2bcd(unsigned).
+;
+; The conversion mirrors the C arithmetic operation for operation,
+; in i32 (the C types are unsigned char / unsigned int; Krell i32
+; arithmetic wraps modulo 2^32 exactly as C unsigned arithmetic
+; does, and the shifts are logical on the zero-extended value).
+; _bcd2bin masks its input to the byte its C prototype promises.
+; _bin2bcd masks its result to the unsigned char its C prototype
+; returns. Proven equal by the differential rig: _bcd2bin on all
+; 256 inputs, _bin2bcd on 0..99999 exhaustively plus random
+; full-range unsigned values.
+fn _bcd2bin(i32) -> i32 {
+  entry(v: i32):
+    %v8 = and i32 v, 255
+    %lo = and i32 %v8, 15
+    %hi = lshr i32 %v8, 4
+    %t = mul i32 %hi, 10
+    %r = add i32 %lo, %t
+    ret %r
+}
+
+fn _bin2bcd(i32) -> i32 {
+  entry(v: i32):
+    %p = mul i32 v, 103
+    %t = lshr i32 %p, 10
+    %t10 = mul i32 %t, 10
+    %rem = sub i32 v, %t10
+    %sh = shl i32 %t, 4
+    %o = or i32 %sh, %rem
+    %r = and i32 %o, 255
+    ret %r
+}

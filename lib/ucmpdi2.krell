@@ -1,0 +1,15 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+; Krellinux Phase 1 conversion of lib/ucmpdi2.c:
+; __ucmpdi2(unsigned long long, unsigned long long).
+;
+; The unsigned counterpart of __cmpdi2: 0 (less), 1 (equal),
+; 2 (greater) by unsigned three-way compare. Proven equal by the
+; differential rig over structured and random operand pairs.
+fn __ucmpdi2(i64, i64) -> i64 {
+  entry(a: i64, b: i64):
+    %lt = icmp.ult i64 a, b
+    %gt = icmp.ugt i64 a, b
+    %t = select i64 %gt, 2, 1
+    %r = select i64 %lt, 0, %t
+    ret %r
+}

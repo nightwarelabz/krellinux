@@ -1,0 +1,13 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+; Krellinux Phase 1 conversion of lib/ashrdi3.c: __ashrdi3(long long, int).
+;
+; See ashldi3.krell for the conversion rationale: the C file's
+; 32-bit-halves construction is exactly an arithmetic 64-bit shift,
+; which Krell expresses natively (ashr sign-fills; shift amount
+; modulo 64). Proven equal on the whole defined domain (counts
+; 0..63) by the differential rig.
+fn __ashrdi3(i64, i64) -> i64 {
+  entry(u: i64, b: i64):
+    %r = ashr i64 u, b
+    ret %r
+}

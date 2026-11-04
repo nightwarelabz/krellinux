@@ -1,0 +1,857 @@
+; SPDX-License-Identifier: GPL-2.0
+; Krellinux Phase 1 conversion of lib/string.c: the generic
+; string and memory functions. Every function in lib/string.c is
+; converted except strlcat(), whose BUG_ON() trap on a caller
+; contract violation has no Krell counterpart.
+;
+; The C bodies in this tree are byte loops (the word-at-a-time
+; paths in memcmp() and sized_strscpy() are optimizations whose
+; observable results -- return values and memory contents -- the
+; byte forms reproduce exactly; sized_strscpy()'s one difference
+; is its WARN_ON_ONCE diagnostic for count > INT_MAX, which is a
+; log line, not a result). One more contract note for
+; sized_strscpy(): bytes of dest past the terminating NUL are
+; unspecified -- the C word-at-a-time path may zero a few of
+; them (the extent varies with configuration), the Krell form
+; leaves them untouched; the rig compares the result string,
+; the return value, and everything outside the dest window.
+; Case conversion follows the kernel's
+; __tolower() over the _ctype table: the table's upper-case set
+; is 'A'..'Z' plus the Latin-1 ranges 192..214 and 216..222,
+; and those bytes map to +32; every other byte is unchanged.
+; (The differential rig proves this against the real table on
+; all 256x256 single-byte string pairs.)
+;
+; Krell has no null-pointer constant and no pointer comparisons.
+; Two internal helpers bridge that: kls_null() materializes a
+; null pointer by type-punning zero through an alloca slot, and
+; the functions that must compare pointers (memmove, strsep)
+; pun them through alloca slots and compare the integers.
+; These helpers are conversion-internal; their names are not
+; part of the kernel ABI.
+;
+; Proven equal by the differential rig (tools/converge/rig/,
+; batch 3) against the C originals compiled from lib/string.c.
+
+; --- internal helpers ------------------------------------------------
+
+fn kls_null() -> ptr {
+  entry():
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    %v = load ptr, %slot
+    ret %v
+}
+
+fn kls_tolower(i64) -> i64 {
+  entry(v: i64):
+    %a1 = icmp.sge i64 v, 65
+    %a2 = icmp.sle i64 v, 90
+    %a = and i1 %a1, %a2
+    %b1 = icmp.sge i64 v, 192
+    %b2 = icmp.sle i64 v, 214
+    %b = and i1 %b1, %b2
+    %c1 = icmp.sge i64 v, 216
+    %c2 = icmp.sle i64 v, 222
+    %c = and i1 %c1, %c2
+    %ab = or i1 %a, %b
+    %is = or i1 %ab, %c
+    %d = add i64 v, 32
+    %r = select i64 %is, %d, v
+    ret %r
+}
+
+; --- length ----------------------------------------------------------
+
+fn strlen(ptr) -> i64 {
+  entry(s: ptr):
+    br loop(0)
+  loop(i: i64):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, step(i), done(i)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done(i: i64):
+    ret i
+}
+
+fn strnlen(ptr, i64) -> i64 {
+  entry(s: ptr, count: i64):
+    br loop(0)
+  loop(i: i64):
+    %lt = icmp.slt i64 i, count
+    condbr %lt, chk(i), done(i)
+  chk(i: i64):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, step(i), done(i)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done(i: i64):
+    ret i
+}
+
+; --- copy ------------------------------------------------------------
+
+fn strcpy(ptr, ptr) -> ptr {
+  entry(d: ptr, s: ptr):
+    br loop(0)
+  loop(i: i64):
+    %sp = gep i8 s, i
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, step(i), done()
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done():
+    ret d
+}
+
+fn stpcpy(ptr, ptr) -> ptr {
+  entry(d: ptr, s: ptr):
+    br loop(0)
+  loop(i: i64):
+    %sp = gep i8 s, i
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, step(i), done(i)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done(i: i64):
+    %e = gep i8 d, i
+    ret %e
+}
+
+fn strcat(ptr, ptr) -> ptr {
+  entry(d: ptr, s: ptr):
+    br scan(0)
+  scan(i: i64):
+    %p = gep i8 d, i
+    %b = load i8, %p
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, sstep(i), copy(i, 0)
+  sstep(i: i64):
+    %i2 = add i64 i, 1
+    br scan(%i2)
+  copy(i: i64, j: i64):
+    %sp = gep i8 s, j
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, cstep(i, j), done()
+  cstep(i: i64, j: i64):
+    %i2 = add i64 i, 1
+    %j2 = add i64 j, 1
+    br copy(%i2, %j2)
+  done():
+    ret d
+}
+
+fn strncat(ptr, ptr, i64) -> ptr {
+  entry(d: ptr, s: ptr, count: i64):
+    %zc = icmp.eq i64 count, 0
+    condbr %zc, done(), scan(0)
+  scan(i: i64):
+    %p = gep i8 d, i
+    %b = load i8, %p
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, sstep(i), copy(i, 0, count)
+  sstep(i: i64):
+    %i2 = add i64 i, 1
+    br scan(%i2)
+  copy(i: i64, j: i64, c: i64):
+    %sp = gep i8 s, j
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %nz = icmp.ne i8 %b, 0
+    condbr %nz, dec(i, j, c), done()
+  dec(i: i64, j: i64, c: i64):
+    %c2 = sub i64 c, 1
+    %z = icmp.eq i64 %c2, 0
+    condbr %z, term(i), cstep(i, j, %c2)
+  term(i: i64):
+    %i2 = add i64 i, 1
+    %dp = gep i8 d, %i2
+    store i8 %dp, 0
+    br done()
+  cstep(i: i64, j: i64, c: i64):
+    %i2 = add i64 i, 1
+    %j2 = add i64 j, 1
+    br copy(%i2, %j2, c)
+  done():
+    ret d
+}
+
+fn sized_strscpy(ptr, ptr, i64) -> i64 {
+  entry(d: ptr, s: ptr, count: i64):
+    %neg1 = sub i64 0, 1
+    %e2big = mul i64 %neg1, 7
+    %zc = icmp.eq i64 count, 0
+    condbr %zc, bad(%e2big), lim(count, %e2big)
+  lim(count: i64, e2big: i64):
+    %big = icmp.sgt i64 count, 2147483647
+    condbr %big, bad(e2big), loop(0, count, e2big)
+  loop(i: i64, count: i64, e2big: i64):
+    %room = icmp.slt i64 i, count
+    condbr %room, body(i, count, e2big), full(e2big)
+  body(i: i64, count: i64, e2big: i64):
+    %last = sub i64 count, 1
+    %isl = icmp.eq i64 i, %last
+    condbr %isl, force(i, e2big), chr(i, count, e2big)
+  chr(i: i64, count: i64, e2big: i64):
+    %sp = gep i8 s, i
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %z = icmp.eq i8 %b, 0
+    condbr %z, ok(i), step(i, count, e2big)
+  step(i: i64, count: i64, e2big: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2, count, e2big)
+  force(i: i64, e2big: i64):
+    %dp = gep i8 d, i
+    store i8 %dp, 0
+    %sp = gep i8 s, i
+    %b = load i8, %sp
+    %z = icmp.eq i8 %b, 0
+    condbr %z, ok(i), bad(e2big)
+  full(e2big: i64):
+    ret e2big
+  bad(e2big: i64):
+    ret e2big
+  ok(i: i64):
+    ret i
+}
+
+; --- compare ---------------------------------------------------------
+
+fn strcmp(ptr, ptr) -> i64 {
+  entry(a: ptr, b: ptr):
+    %neg1 = sub i64 0, 1
+    br loop(0, %neg1)
+  loop(i: i64, neg1: i64):
+    %pa = gep i8 a, i
+    %x = load i8, %pa
+    %xu = zext i64 %x
+    %pb = gep i8 b, i
+    %y = load i8, %pb
+    %yu = zext i64 %y
+    %ne = icmp.ne i64 %xu, %yu
+    condbr %ne, diff(%xu, %yu, neg1), chk(%xu, i, neg1)
+  diff(xu: i64, yu: i64, neg1: i64):
+    %lt = icmp.ult i64 xu, yu
+    %r = select i64 %lt, neg1, 1
+    ret %r
+  chk(xu: i64, i: i64, neg1: i64):
+    %z = icmp.eq i64 xu, 0
+    condbr %z, eq(), step(i, neg1)
+  step(i: i64, neg1: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2, neg1)
+  eq():
+    ret 0
+}
+
+fn strncmp(ptr, ptr, i64) -> i64 {
+  entry(a: ptr, b: ptr, n: i64):
+    %neg1 = sub i64 0, 1
+    br loop(0, %neg1)
+  loop(i: i64, neg1: i64):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, neg1), eq()
+  body(i: i64, neg1: i64):
+    %pa = gep i8 a, i
+    %x = load i8, %pa
+    %xu = zext i64 %x
+    %pb = gep i8 b, i
+    %y = load i8, %pb
+    %yu = zext i64 %y
+    %ne = icmp.ne i64 %xu, %yu
+    condbr %ne, diff(%xu, %yu, neg1), chk(%xu, i, neg1)
+  diff(xu: i64, yu: i64, neg1: i64):
+    %lt = icmp.ult i64 xu, yu
+    %r = select i64 %lt, neg1, 1
+    ret %r
+  chk(xu: i64, i: i64, neg1: i64):
+    %z = icmp.eq i64 xu, 0
+    condbr %z, eq(), step(i, neg1)
+  step(i: i64, neg1: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2, neg1)
+  eq():
+    ret 0
+}
+
+fn strcasecmp(ptr, ptr) -> i64 {
+  entry(a: ptr, b: ptr):
+    br loop(0)
+  loop(i: i64):
+    %pa = gep i8 a, i
+    %x = load i8, %pa
+    %xu = zext i64 %x
+    %cx = call i64 kls_tolower(%xu)
+    %pb = gep i8 b, i
+    %y = load i8, %pb
+    %yu = zext i64 %y
+    %cy = call i64 kls_tolower(%yu)
+    %ne = icmp.ne i64 %cx, %cy
+    condbr %ne, done(%cx, %cy), chk(%cx, i)
+  chk(cx: i64, i: i64):
+    %z = icmp.eq i64 cx, 0
+    condbr %z, done(cx, cx), step(i)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done(x: i64, y: i64):
+    %r = sub i64 x, y
+    ret %r
+}
+
+fn strncasecmp(ptr, ptr, i64) -> i64 {
+  entry(a: ptr, b: ptr, len: i64):
+    %z = icmp.eq i64 len, 0
+    condbr %z, eq(), loop(0, len)
+  loop(i: i64, len: i64):
+    %pa = gep i8 a, i
+    %x = load i8, %pa
+    %xu = zext i64 %x
+    %pb = gep i8 b, i
+    %y = load i8, %pb
+    %yu = zext i64 %y
+    %zx = icmp.eq i64 %xu, 0
+    %zy = icmp.eq i64 %yu, 0
+    %zb = or i1 %zx, %zy
+    condbr %zb, done(%xu, %yu), same(%xu, %yu, i, len)
+  same(xu: i64, yu: i64, i: i64, len: i64):
+    %e = icmp.eq i64 xu, yu
+    condbr %e, adv(xu, yu, i, len), lower(xu, yu, i, len)
+  lower(xu: i64, yu: i64, i: i64, len: i64):
+    %cx = call i64 kls_tolower(xu)
+    %cy = call i64 kls_tolower(yu)
+    %e = icmp.eq i64 %cx, %cy
+    condbr %e, adv(%cx, %cy, i, len), done(%cx, %cy)
+  adv(x: i64, y: i64, i: i64, len: i64):
+    %l2 = sub i64 len, 1
+    %more = icmp.ne i64 %l2, 0
+    condbr %more, step(i, %l2), done(x, y)
+  step(i: i64, len: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2, len)
+  done(x: i64, y: i64):
+    %r = sub i64 x, y
+    ret %r
+  eq():
+    ret 0
+}
+
+; --- search ----------------------------------------------------------
+
+fn strchr(ptr, i64) -> ptr {
+  entry(s: ptr, c: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    condbr %hit, found(i), chk(i, %b, t)
+  chk(i: i64, b: i8, t: i8):
+    %z = icmp.eq i8 b, 0
+    condbr %z, miss(), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  found(i: i64):
+    %p = gep i8 s, i
+    ret %p
+  miss():
+    %n = call ptr kls_null()
+    ret %n
+}
+
+fn strchrnul(ptr, i64) -> ptr {
+  entry(s: ptr, c: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    %z = icmp.eq i8 %b, 0
+    %stop = or i1 %hit, %z
+    condbr %stop, found(i), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  found(i: i64):
+    %p = gep i8 s, i
+    ret %p
+}
+
+fn strnchrnul(ptr, i64, i64) -> ptr {
+  entry(s: ptr, count: i64, c: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %lt = icmp.slt i64 i, count
+    condbr %lt, body(i, t), done(i)
+  body(i: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    %z = icmp.eq i8 %b, 0
+    %stop = or i1 %hit, %z
+    condbr %stop, done(i), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  done(i: i64):
+    %p = gep i8 s, i
+    ret %p
+}
+
+fn strrchr(ptr, i64) -> ptr {
+  entry(s: ptr, c: i64):
+    %t = trunc i8 c
+    br loop(0, 0, 0, %t)
+  loop(i: i64, li: i64, has: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    %li2 = select i64 %hit, i, li
+    %h2 = select i64 %hit, 1, has
+    %z = icmp.eq i8 %b, 0
+    condbr %z, done(%li2, %h2), step(i, %li2, %h2, t)
+  step(i: i64, li: i64, has: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, li, has, t)
+  done(li: i64, has: i64):
+    %hn = icmp.ne i64 has, 0
+    condbr %hn, found(li), miss()
+  found(li: i64):
+    %p = gep i8 s, li
+    ret %p
+  miss():
+    %n = call ptr kls_null()
+    ret %n
+}
+
+fn strnchr(ptr, i64, i64) -> ptr {
+  entry(s: ptr, count: i64, c: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %lt = icmp.slt i64 i, count
+    condbr %lt, body(i, t), miss()
+  body(i: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    condbr %hit, found(i), chk(i, %b, t)
+  chk(i: i64, b: i8, t: i8):
+    %z = icmp.eq i8 b, 0
+    condbr %z, miss(), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  found(i: i64):
+    %p = gep i8 s, i
+    ret %p
+  miss():
+    %n = call ptr kls_null()
+    ret %n
+}
+
+fn strspn(ptr, ptr) -> i64 {
+  entry(s: ptr, acc: ptr):
+    br outer(0)
+  outer(i: i64):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %z = icmp.eq i8 %b, 0
+    condbr %z, done(i), inner(i, %b, 0)
+  inner(i: i64, b: i8, j: i64):
+    %q = gep i8 acc, j
+    %a = load i8, %q
+    %za = icmp.eq i8 %a, 0
+    condbr %za, done(i), match(i, b, j, %a)
+  match(i: i64, b: i8, j: i64, a: i8):
+    %e = icmp.eq i8 a, b
+    condbr %e, step(i), istep(i, b, j)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br outer(%i2)
+  istep(i: i64, b: i8, j: i64):
+    %j2 = add i64 j, 1
+    br inner(i, b, %j2)
+  done(i: i64):
+    ret i
+}
+
+fn strcspn(ptr, ptr) -> i64 {
+  entry(s: ptr, rej: ptr):
+    br outer(0)
+  outer(i: i64):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %z = icmp.eq i8 %b, 0
+    condbr %z, done(i), inner(i, %b, 0)
+  inner(i: i64, b: i8, j: i64):
+    %q = gep i8 rej, j
+    %a = load i8, %q
+    %za = icmp.eq i8 %a, 0
+    condbr %za, step(i), match(i, b, j, %a)
+  match(i: i64, b: i8, j: i64, a: i8):
+    %e = icmp.eq i8 a, b
+    condbr %e, done(i), istep(i, b, j)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br outer(%i2)
+  istep(i: i64, b: i8, j: i64):
+    %j2 = add i64 j, 1
+    br inner(i, b, %j2)
+  done(i: i64):
+    ret i
+}
+
+fn strpbrk(ptr, ptr) -> ptr {
+  entry(cs: ptr, ct: ptr):
+    br outer(0)
+  outer(i: i64):
+    %p = gep i8 cs, i
+    %b = load i8, %p
+    %z = icmp.eq i8 %b, 0
+    condbr %z, miss(), inner(i, %b, 0)
+  inner(i: i64, b: i8, j: i64):
+    %q = gep i8 ct, j
+    %a = load i8, %q
+    %za = icmp.eq i8 %a, 0
+    condbr %za, step(i), match(i, b, j, %a)
+  match(i: i64, b: i8, j: i64, a: i8):
+    %e = icmp.eq i8 a, b
+    condbr %e, found(i), istep(i, b, j)
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br outer(%i2)
+  istep(i: i64, b: i8, j: i64):
+    %j2 = add i64 j, 1
+    br inner(i, b, %j2)
+  found(i: i64):
+    %p = gep i8 cs, i
+    ret %p
+  miss():
+    %n = call ptr kls_null()
+    ret %n
+}
+
+fn strsep(ptr, ptr) -> ptr {
+  entry(pp: ptr, ct: ptr):
+    %begin = load ptr, %pp
+    %slot = alloca 8, 8
+    store ptr %slot, %begin
+    %bi = load i64, %slot
+    %isn = icmp.eq i64 %bi, 0
+    condbr %isn, miss(), work(%begin)
+  work(begin: ptr):
+    %end = call ptr strpbrk(begin, ct)
+    %slot = alloca 8, 8
+    store ptr %slot, %end
+    %ei = load i64, %slot
+    %isn = icmp.eq i64 %ei, 0
+    condbr %isn, setnull(begin, %end), cut(begin, %end)
+  cut(begin: ptr, end: ptr):
+    store i8 %end, 0
+    %next = gep i8 end, 1
+    store ptr %pp, %next
+    ret begin
+  setnull(begin: ptr, end: ptr):
+    store ptr %pp, %end
+    ret begin
+  miss():
+    %n = call ptr kls_null()
+    ret %n
+}
+
+; --- memory ----------------------------------------------------------
+
+fn memset(ptr, i64, i64) -> ptr {
+  entry(s: ptr, c: i64, n: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, t), done()
+  body(i: i64, t: i8):
+    %p = gep i8 s, i
+    store i8 %p, t
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  done():
+    ret s
+}
+
+fn memset16(ptr, i64, i64) -> ptr {
+  entry(s: ptr, v: i64, n: i64):
+    %t = trunc i16 v
+    br loop(0, %t)
+  loop(i: i64, t: i16):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, t), done()
+  body(i: i64, t: i16):
+    %p = gep i16 s, i
+    store i16 %p, t
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  done():
+    ret s
+}
+
+fn memset32(ptr, i64, i64) -> ptr {
+  entry(s: ptr, v: i64, n: i64):
+    %t = trunc i32 v
+    br loop(0, %t)
+  loop(i: i64, t: i32):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, t), done()
+  body(i: i64, t: i32):
+    %p = gep i32 s, i
+    store i32 %p, t
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  done():
+    ret s
+}
+
+fn memset64(ptr, i64, i64) -> ptr {
+  entry(s: ptr, v: i64, n: i64):
+    br loop(0)
+  loop(i: i64):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i), done()
+  body(i: i64):
+    %p = gep i64 s, i
+    store i64 %p, v
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done():
+    ret s
+}
+
+fn memcpy(ptr, ptr, i64) -> ptr {
+  entry(d: ptr, s: ptr, n: i64):
+    br loop(0)
+  loop(i: i64):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i), done()
+  body(i: i64):
+    %sp = gep i8 s, i
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  done():
+    ret d
+}
+
+fn memmove(ptr, ptr, i64) -> ptr {
+  entry(d: ptr, s: ptr, n: i64):
+    %sd = alloca 8, 8
+    %ss = alloca 8, 8
+    store ptr %sd, %d
+    store ptr %ss, %s
+    %di = load i64, %sd
+    %si = load i64, %ss
+    %le = icmp.sle i64 %di, %si
+    condbr %le, fwd(0), bwd(n)
+  fwd(i: i64):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, fbody(i), done()
+  fbody(i: i64):
+    %sp = gep i8 s, i
+    %b = load i8, %sp
+    %dp = gep i8 d, i
+    store i8 %dp, %b
+    %i2 = add i64 i, 1
+    br fwd(%i2)
+  bwd(k: i64):
+    %gt = icmp.sgt i64 k, 0
+    condbr %gt, bbody(k), done()
+  bbody(k: i64):
+    %i = sub i64 k, 1
+    %sp = gep i8 s, %i
+    %b = load i8, %sp
+    %dp = gep i8 d, %i
+    store i8 %dp, %b
+    br bwd(%i)
+  done():
+    ret d
+}
+
+fn memcmp(ptr, ptr, i64) -> i64 {
+  entry(a: ptr, b: ptr, n: i64):
+    br loop(0)
+  loop(i: i64):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i), eq()
+  body(i: i64):
+    %pa = gep i8 a, i
+    %x = load i8, %pa
+    %xu = zext i64 %x
+    %pb = gep i8 b, i
+    %y = load i8, %pb
+    %yu = zext i64 %y
+    %ne = icmp.ne i64 %xu, %yu
+    condbr %ne, diff(%xu, %yu), step(i)
+  diff(xu: i64, yu: i64):
+    %r = sub i64 xu, yu
+    ret %r
+  step(i: i64):
+    %i2 = add i64 i, 1
+    br loop(%i2)
+  eq():
+    ret 0
+}
+
+fn bcmp(ptr, ptr, i64) -> i64 {
+  entry(a: ptr, b: ptr, n: i64):
+    %r = call i64 memcmp(a, b, n)
+    ret %r
+}
+
+fn memscan(ptr, i64, i64) -> ptr {
+  entry(a: ptr, c: i64, n: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, t), done(n)
+  body(i: i64, t: i8):
+    %p = gep i8 a, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    condbr %hit, found(i), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  found(i: i64):
+    %p = gep i8 a, i
+    ret %p
+  done(n: i64):
+    %p = gep i8 a, n
+    ret %p
+}
+
+fn memchr(ptr, i64, i64) -> ptr {
+  entry(s: ptr, c: i64, n: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, t), miss()
+  body(i: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %hit = icmp.eq i8 %b, t
+    condbr %hit, found(i), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  found(i: i64):
+    %p = gep i8 s, i
+    ret %p
+  miss():
+    %np = call ptr kls_null()
+    ret %np
+}
+
+fn memchr_inv(ptr, i64, i64) -> ptr {
+  entry(s: ptr, c: i64, n: i64):
+    %t = trunc i8 c
+    br loop(0, %t)
+  loop(i: i64, t: i8):
+    %lt = icmp.slt i64 i, n
+    condbr %lt, body(i, t), miss()
+  body(i: i64, t: i8):
+    %p = gep i8 s, i
+    %b = load i8, %p
+    %ne = icmp.ne i8 %b, t
+    condbr %ne, found(i), step(i, t)
+  step(i: i64, t: i8):
+    %i2 = add i64 i, 1
+    br loop(%i2, t)
+  found(i: i64):
+    %p = gep i8 s, i
+    ret %p
+  miss():
+    %np = call ptr kls_null()
+    ret %np
+}
+
+; --- substring -------------------------------------------------------
+
+fn strstr(ptr, ptr) -> ptr {
+  entry(s1: ptr, s2: ptr):
+    %l2 = call i64 strlen(s2)
+    %z = icmp.eq i64 %l2, 0
+    condbr %z, whole(), sized(%l2)
+  whole():
+    ret s1
+  sized(l2: i64):
+    %l1 = call i64 strlen(s1)
+    br loop(s1, %l1, l2)
+  loop(p: ptr, rem: i64, l2: i64):
+    %ge = icmp.sge i64 rem, l2
+    condbr %ge, try(p, rem, l2), miss()
+  try(p: ptr, rem: i64, l2: i64):
+    %m = call i64 memcmp(p, s2, l2)
+    %z = icmp.eq i64 %m, 0
+    condbr %z, found(p), step(p, rem, l2)
+  step(p: ptr, rem: i64, l2: i64):
+    %p2 = gep i8 p, 1
+    %r2 = sub i64 rem, 1
+    br loop(%p2, %r2, l2)
+  found(p: ptr):
+    ret p
+  miss():
+    %np = call ptr kls_null()
+    ret %np
+}
+
+fn strnstr(ptr, ptr, i64) -> ptr {
+  entry(s1: ptr, s2: ptr, len: i64):
+    %l2 = call i64 strlen(s2)
+    %z = icmp.eq i64 %l2, 0
+    condbr %z, whole(), loop(s1, len, %l2)
+  whole():
+    ret s1
+  loop(p: ptr, len: i64, l2: i64):
+    %ge = icmp.sge i64 len, l2
+    condbr %ge, try(p, len, l2), miss()
+  try(p: ptr, len: i64, l2: i64):
+    %m = call i64 memcmp(p, s2, l2)
+    %z = icmp.eq i64 %m, 0
+    condbr %z, found(p), step(p, len, l2)
+  step(p: ptr, len: i64, l2: i64):
+    %p2 = gep i8 p, 1
+    %l3 = sub i64 len, 1
+    br loop(%p2, %l3, l2)
+  found(p: ptr):
+    ret p
+  miss():
+    %np = call ptr kls_null()
+    ret %np
+}

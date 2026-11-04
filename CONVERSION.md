@@ -165,7 +165,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/sort.c` | C | ASSIST | indirect calls / function pointers |
 | `lib/stackdepot.c` | C | ASSIST | indirect calls / function pointers; inline asm |
 | `lib/stmp_device.c` | C | AUTO | - |
-| `lib/string.c` | C | ASSIST | inline asm |
+| `lib/string.c` | KRELL (functions) | ASSIST | 33 of 34 functions rewritten in Krell (lib/string.krell): the full string/memory set (strlen/strnlen, the copy and compare families, the search family, strspn/strcspn/strpbrk, strsep, memset/memset16/32/64, memcpy/memmove, memcmp/bcmp, memscan/memchr/memchr_inv, strstr/strnstr, sized_strscpy); differential rig vs the C originals: 92,899 cases, 0 divergence, including all 256x256 single-byte pairs for the case functions against the real _ctype table (its Latin-1 upper ranges are mirrored); Krell objects linked into vmlinux and self-checked at boot (Phase 1 batch 3). Residue: strlcat() stays C -- its BUG_ON() trap on a caller contract violation has no Krell counterpart. Notes: sized_strscpy() past-the-NUL dest bytes are unspecified in C (word-at-a-time may zero some) and left untouched by the Krell form; its WARN_ON_ONCE for count > INT_MAX is a log line, not a result. The C file still provides the symbols. |
 | `lib/string_helpers.c` | C | ASSIST | inline asm |
 | `lib/strncpy_from_user.c` | C | ASSIST | inline asm |
 | `lib/strnlen_user.c` | C | ASSIST | inline asm |

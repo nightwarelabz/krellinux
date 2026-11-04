@@ -1,0 +1,1234 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/btree.c converted to Krell (Phase 1 batch 7).
+;
+; The B+Tree is the C algorithm operation for operation.
+; Layout (x86_64): struct btree_head { node @0, mempool @8,
+; height (int) @16 }; struct btree_geo { keylen (int) @0,
+; no_pairs (int) @4, no_longs (int) @8 }.  A node is an
+; array of unsigned longs: keys first (no_longs of them),
+; then no_pairs value slots.  NODESIZE is 128 here.
+;
+; Residue: btree_alloc() and btree_free() stay in C - they
+; are the only functions that touch the file-local static
+; btree_cachep.  btree_init() below takes their addresses
+; with funcptr and hands them to mempool_create_node_noprof, exactly
+; as the C original does.
+;
+; BUG_ON() traps: where C asserts an invariant with
+; BUG_ON, the Krell form calls panic() with a message and
+; does not return, which preserves the observable contract
+; (the kernel dies; the operation never proceeds).  The
+; sites are find_level (2), btree_insert_level (3),
+; rebalance (1), btree_insert (1) and btree_merge (1).
+;
+; Krell data blobs are constants (the backends emit them
+; in .rodata), so the two C stack arrays of MAX_KEYLEN
+; (2) longs cannot live in module data.  btree_get_prev
+; works on the caller's key buffer in place: the original
+; key is saved word-wise in two 8-byte alloca slots and
+; restored on a miss, which reproduces C's contract (on
+; NULL return the caller's key is unchanged; on a hit it
+; holds the found key).  btree_merge's key/dup pair lives
+; in one node allocated from the target's mempool for the
+; duration of the merge and freed on every exit; if that
+; allocation fails the merge returns -ENOMEM before
+; touching either tree.
+;
+; Pointer values move through the alloca bridge when C
+; compares or converts them; node slots hold unsigned
+; longs and are loaded/stored as i64, materialized as
+; pointers only for dereference.
+;
+; The mempool externs use the link-level _noprof symbols:
+; mempool_alloc and mempool_create are header macros over
+; mempool_alloc_noprof and mempool_create_node_noprof (the
+; create macro supplies GFP_KERNEL and NUMA_NO_NODE), so no
+; plain mempool_alloc/mempool_create symbols exist to link.
+
+extern mempool_alloc_noprof(ptr, i64) -> ptr
+extern mempool_free(ptr, ptr) -> void
+extern mempool_create_node_noprof(i64, ptr, ptr, ptr, i64, i64) -> ptr
+extern mempool_destroy(ptr) -> void
+extern memset(ptr, i64, i64) -> ptr
+extern panic(ptr) -> void
+extern btree_alloc(i64, ptr) -> ptr
+extern btree_free(ptr, ptr) -> void
+
+sig klb_visitor_fn(ptr, i64, ptr, i64, ptr) -> void
+sig klb_visitorl_t(ptr, i64, i64, i64) -> void
+sig klb_visitor32_t(ptr, i64, i32, i64) -> void
+sig klb_visitor64_t(ptr, i64, i64, i64) -> void
+sig klb_visitor128_t(ptr, i64, i64, i64, i64) -> void
+
+fn klb_call_visitor(ptr, ptr, i64, ptr, i64, ptr) -> void {
+  entry(slot: ptr, elem: ptr, opaque: i64, key: ptr, index: i64, func2: ptr):
+    %fp = load ptr, slot
+    calli void klb_visitor_fn %fp(elem, opaque, key, index, func2)
+    ret
+}
+
+fn klb_call_visitorl(ptr, ptr, i64, i64, i64) -> void {
+  entry(slot: ptr, elem: ptr, opaque: i64, k: i64, index: i64):
+    %fp = load ptr, slot
+    calli void klb_visitorl_t %fp(elem, opaque, k, index)
+    ret
+}
+
+fn klb_call_visitor32(ptr, ptr, i64, i32, i64) -> void {
+  entry(slot: ptr, elem: ptr, opaque: i64, k: i32, index: i64):
+    %fp = load ptr, slot
+    calli void klb_visitor32_t %fp(elem, opaque, k, index)
+    ret
+}
+
+fn klb_call_visitor64(ptr, ptr, i64, i64, i64) -> void {
+  entry(slot: ptr, elem: ptr, opaque: i64, k: i64, index: i64):
+    %fp = load ptr, slot
+    calli void klb_visitor64_t %fp(elem, opaque, k, index)
+    ret
+}
+
+fn klb_call_visitor128(ptr, ptr, i64, i64, i64, i64) -> void {
+  entry(slot: ptr, elem: ptr, opaque: i64, k0: i64, k1: i64, index: i64):
+    %fp = load ptr, slot
+    calli void klb_visitor128_t %fp(elem, opaque, k0, k1, index)
+    ret
+}
+
+data klb_bugmsg: i8 = { 107, 114, 101, 108, 108, 105, 110, 117, 120, 58, 32, 98, 116, 114, 101, 101, 32, 105, 110, 118, 97, 114, 105, 97, 110, 116, 32, 118, 105, 111, 108, 97, 116, 101, 100, 10, 0 }
+
+fn klb_ptrval(ptr) -> i64 {
+  entry(p: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    store ptr %slot, p
+    %v = load i64, %slot
+    ret %v
+}
+
+fn klb_fromval(i64) -> ptr {
+  entry(v: i64):
+    %slot = alloca 8, 8
+    store i64 %slot, v
+    %p = load ptr, %slot
+    ret %p
+}
+
+fn klb_null() -> ptr {
+  entry():
+    %p = call ptr klb_fromval(0)
+    ret %p
+}
+
+fn klb_bug() -> void {
+  entry():
+    %msg = dataptr 0
+    call void panic(%msg)
+    br hang()
+  hang():
+    br hang()
+}
+
+fn klb_keylen(ptr) -> i64 {
+  entry(geo: ptr):
+    %v = load i32, geo
+    %r = sext i64 %v
+    ret %r
+}
+
+fn klb_nopairs(ptr) -> i64 {
+  entry(geo: ptr):
+    %p = gep i8 geo, 4
+    %v = load i32, %p
+    %r = sext i64 %v
+    ret %r
+}
+
+fn klb_nolongs(ptr) -> i64 {
+  entry(geo: ptr):
+    %p = gep i8 geo, 8
+    %v = load i32, %p
+    %r = sext i64 %v
+    ret %r
+}
+
+fn klb_head_height(ptr) -> i64 {
+  entry(head: ptr):
+    %p = gep i8 head, 16
+    %v = load i32, %p
+    %r = sext i64 %v
+    ret %r
+}
+
+fn klb_set_height(ptr, i64) -> void {
+  entry(head: ptr, h: i64):
+    %p = gep i8 head, 16
+    %v = trunc i32 h
+    store i32 %p, %v
+    ret
+}
+
+; address of key n in a node
+fn klb_bkey(ptr, ptr, i64) -> ptr {
+  entry(geo: ptr, node: ptr, n: i64):
+    %kl = call i64 klb_keylen(geo)
+    %idx = mul i64 n, %kl
+    %off = mul i64 %idx, 8
+    %r = gep i8 node, %off
+    ret %r
+}
+
+; value slot n of a node, as an integer (pointer bits)
+fn klb_bval(ptr, ptr, i64) -> i64 {
+  entry(geo: ptr, node: ptr, n: i64):
+    %nl = call i64 klb_nolongs(geo)
+    %idx = add i64 %nl, n
+    %off = mul i64 %idx, 8
+    %p = gep i8 node, %off
+    %v = load i64, %p
+    ret %v
+}
+
+fn klb_setval(ptr, ptr, i64, i64) -> void {
+  entry(geo: ptr, node: ptr, n: i64, val: i64):
+    %nl = call i64 klb_nolongs(geo)
+    %idx = add i64 %nl, n
+    %off = mul i64 %idx, 8
+    %p = gep i8 node, %off
+    store i64 %p, val
+    ret
+}
+
+fn klb_longcmp(ptr, ptr, i64) -> i32 {
+  entry(l1: ptr, l2: ptr, n: i64):
+    br loop(l1, l2, n, 0)
+  loop(l1: ptr, l2: ptr, n: i64, i: i64):
+    %lt = icmp.ult i64 i, n
+    condbr %lt, body(l1, l2, n, i), done()
+  body(l1: ptr, l2: ptr, n: i64, i: i64):
+    %off = mul i64 i, 8
+    %p1 = gep i8 l1, %off
+    %a = load i64, %p1
+    %p2 = gep i8 l2, %off
+    %b = load i64, %p2
+    %lo = icmp.ult i64 %a, %b
+    condbr %lo, neg(l1, l2, n, i), chk_hi(l1, l2, n, i, %a, %b)
+  chk_hi(l1: ptr, l2: ptr, n: i64, i: i64, a: i64, b: i64):
+    %hi = icmp.ugt i64 a, b
+    condbr %hi, pos(), next(l1, l2, n, i)
+  next(l1: ptr, l2: ptr, n: i64, i: i64):
+    %i1 = add i64 i, 1
+    br loop(l1, l2, n, %i1)
+  neg(l1: ptr, l2: ptr, n: i64, i: i64):
+    ret -1
+  pos():
+    ret 1
+  done():
+    ret 0
+}
+
+fn klb_longcpy(ptr, ptr, i64) -> ptr {
+  entry(dest: ptr, src: ptr, n: i64):
+    br loop(dest, src, n, 0)
+  loop(dest: ptr, src: ptr, n: i64, i: i64):
+    %lt = icmp.ult i64 i, n
+    condbr %lt, body(dest, src, n, i), done(dest)
+  body(dest: ptr, src: ptr, n: i64, i: i64):
+    %off = mul i64 i, 8
+    %ps = gep i8 src, %off
+    %v = load i64, %ps
+    %pd = gep i8 dest, %off
+    store i64 %pd, %v
+    %i1 = add i64 i, 1
+    br loop(dest, src, n, %i1)
+  done(dest: ptr):
+    ret dest
+}
+
+fn klb_longset(ptr, i64, i64) -> ptr {
+  entry(s: ptr, c: i64, n: i64):
+    br loop(s, c, n, 0)
+  loop(s: ptr, c: i64, n: i64, i: i64):
+    %lt = icmp.ult i64 i, n
+    condbr %lt, body(s, c, n, i), done(s)
+  body(s: ptr, c: i64, n: i64, i: i64):
+    %off = mul i64 i, 8
+    %p = gep i8 s, %off
+    store i64 %p, c
+    %i1 = add i64 i, 1
+    br loop(s, c, n, %i1)
+  done(s: ptr):
+    ret s
+}
+
+fn klb_setkey(ptr, ptr, i64, ptr) -> void {
+  entry(geo: ptr, node: ptr, n: i64, key: ptr):
+    %dst = call ptr klb_bkey(geo, node, n)
+    %kl = call i64 klb_keylen(geo)
+    %r = call ptr klb_longcpy(%dst, key, %kl)
+    ret
+}
+
+fn klb_clearpair(ptr, ptr, i64) -> void {
+  entry(geo: ptr, node: ptr, n: i64):
+    %dst = call ptr klb_bkey(geo, node, n)
+    %kl = call i64 klb_keylen(geo)
+    %r = call ptr klb_longset(%dst, 0, %kl)
+    call void klb_setval(geo, node, n, 0)
+    ret
+}
+
+fn klb_keycmp(ptr, ptr, i64, ptr) -> i32 {
+  entry(geo: ptr, node: ptr, pos: i64, key: ptr):
+    %k = call ptr klb_bkey(geo, node, pos)
+    %kl = call i64 klb_keylen(geo)
+    %r = call i32 klb_longcmp(%k, key, %kl)
+    ret %r
+}
+
+fn klb_keyzero(ptr, ptr) -> i64 {
+  entry(geo: ptr, key: ptr):
+    %kl = call i64 klb_keylen(geo)
+    br loop(geo, key, %kl, 0)
+  loop(geo: ptr, key: ptr, kl: i64, i: i64):
+    %lt = icmp.ult i64 i, kl
+    condbr %lt, body(geo, key, kl, i), yes()
+  body(geo: ptr, key: ptr, kl: i64, i: i64):
+    %off = mul i64 i, 8
+    %p = gep i8 key, %off
+    %v = load i64, %p
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, no(), next(geo, key, kl, i)
+  next(geo: ptr, key: ptr, kl: i64, i: i64):
+    %i1 = add i64 i, 1
+    br loop(geo, key, kl, %i1)
+  yes():
+    ret 1
+  no():
+    ret 0
+}
+
+fn klb_dec_key(ptr, ptr) -> void {
+  entry(geo: ptr, key: ptr):
+    %kl = call i64 klb_keylen(geo)
+    %i0 = sub i64 %kl, 1
+    br loop(key, %i0)
+  loop(key: ptr, i: i64):
+    %ge = icmp.sge i64 i, 0
+    condbr %ge, body(key, i), done()
+  body(key: ptr, i: i64):
+    %off = mul i64 i, 8
+    %p = gep i8 key, %off
+    %val = load i64, %p
+    %nv = sub i64 %val, 1
+    store i64 %p, %nv
+    %nz = icmp.ne i64 %val, 0
+    condbr %nz, done(), next(key, i)
+  next(key: ptr, i: i64):
+    %i1 = sub i64 i, 1
+    br loop(key, %i1)
+  done():
+    ret
+}
+
+fn klb_init_head(ptr) -> void {
+  entry(head: ptr):
+    %null = call ptr klb_null()
+    store ptr %head, %null
+    %p = gep i8 head, 16
+    store i32 %p, 0
+    ret
+}
+
+fn klb_node_alloc(ptr, i64) -> ptr {
+  entry(head: ptr, gfp: i64):
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    %node = call ptr mempool_alloc_noprof(%pool, gfp)
+    %nv = call i64 klb_ptrval(%node)
+    %nz = icmp.ne i64 %nv, 0
+    condbr %nz, zero(%node), done(%node)
+  zero(node: ptr):
+    %r = call ptr memset(node, 0, 128)
+    br done(node)
+  done(node: ptr):
+    ret node
+}
+
+fn btree_init_mempool(ptr, ptr) -> void {
+  entry(head: ptr, mempool: ptr):
+    call void klb_init_head(head)
+    %pp = gep i8 head, 8
+    store ptr %pp, mempool
+    ret
+}
+
+fn btree_init(ptr) -> i32 {
+  entry(head: ptr):
+    call void klb_init_head(head)
+    %fa = funcptr btree_alloc
+    %ff = funcptr btree_free
+    %null = call ptr klb_null()
+    %mp = call ptr mempool_create_node_noprof(0, %fa, %ff, %null, 3264, -1)
+    %pp = gep i8 head, 8
+    store ptr %pp, %mp
+    %mv = call i64 klb_ptrval(%mp)
+    %z = icmp.eq i64 %mv, 0
+    condbr %z, enomem(), ok()
+  enomem():
+    ret -12
+  ok():
+    ret 0
+}
+
+fn btree_destroy(ptr) -> void {
+  entry(head: ptr):
+    %node = load ptr, head
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    call void mempool_free(%node, %pool)
+    call void mempool_destroy(%pool)
+    %null = call ptr klb_null()
+    store ptr %pp, %null
+    ret
+}
+
+fn btree_last(ptr, ptr, ptr) -> ptr {
+  entry(head: ptr, geo: ptr, key: ptr):
+    %h = call i64 klb_head_height(head)
+    %node0 = load ptr, head
+    %z = icmp.eq i64 %h, 0
+    condbr %z, nullret(), descend(head, geo, key, %h, %node0)
+  descend(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr):
+    %gt = icmp.sgt i64 h, 1
+    condbr %gt, step(head, geo, key, h, node), leaf(head, geo, key, node)
+  step(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr):
+    %bv = call i64 klb_bval(geo, node, 0)
+    %next = call ptr klb_fromval(%bv)
+    %h1 = sub i64 h, 1
+    br descend(head, geo, key, %h1, %next)
+  leaf(head: ptr, geo: ptr, key: ptr, node: ptr):
+    %src = call ptr klb_bkey(geo, node, 0)
+    %kl = call i64 klb_keylen(geo)
+    %r = call ptr klb_longcpy(key, %src, %kl)
+    %bv = call i64 klb_bval(geo, node, 0)
+    %ret = call ptr klb_fromval(%bv)
+    ret %ret
+  nullret():
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn klb_lookup_node(ptr, ptr, ptr) -> ptr {
+  entry(head: ptr, geo: ptr, key: ptr):
+    %h = call i64 klb_head_height(head)
+    %node0 = load ptr, head
+    %z = icmp.eq i64 %h, 0
+    condbr %z, nullret(), descend(head, geo, key, %h, %node0)
+  descend(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr):
+    %gt = icmp.sgt i64 h, 1
+    condbr %gt, scan(head, geo, key, h, node, 0), done(node)
+  scan(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(head, geo, key, h, node, i), miss()
+  test(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %cz = sext i64 %c
+    %le = icmp.sle i64 %cz, 0
+    condbr %le, follow(head, geo, key, h, node, i), next(head, geo, key, h, node, i)
+  next(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(head, geo, key, h, node, %i1)
+  follow(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %next = call ptr klb_fromval(%bv)
+    %nv = call i64 klb_ptrval(%next)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, nullret(), down(head, geo, key, h, %next)
+  down(head: ptr, geo: ptr, key: ptr, h: i64, node: ptr):
+    %h1 = sub i64 h, 1
+    br descend(head, geo, key, %h1, node)
+  done(node: ptr):
+    ret node
+  miss():
+    %null = call ptr klb_null()
+    ret %null
+  nullret():
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn btree_lookup(ptr, ptr, ptr) -> ptr {
+  entry(head: ptr, geo: ptr, key: ptr):
+    %node = call ptr klb_lookup_node(head, geo, key)
+    %nv = call i64 klb_ptrval(%node)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, nullret(), scan(head, geo, key, %node, 0)
+  scan(head: ptr, geo: ptr, key: ptr, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(head, geo, key, node, i), nullret()
+  test(head: ptr, geo: ptr, key: ptr, node: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %eq = icmp.eq i32 %c, 0
+    condbr %eq, found(geo, node, i), next(head, geo, key, node, i)
+  next(head: ptr, geo: ptr, key: ptr, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(head, geo, key, node, %i1)
+  found(geo: ptr, node: ptr, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %ret = call ptr klb_fromval(%bv)
+    ret %ret
+  nullret():
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn btree_update(ptr, ptr, ptr, ptr) -> i32 {
+  entry(head: ptr, geo: ptr, key: ptr, val: ptr):
+    %node = call ptr klb_lookup_node(head, geo, key)
+    %nv = call i64 klb_ptrval(%node)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, enoent(), scan(head, geo, key, val, %node, 0)
+  scan(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(head, geo, key, val, node, i), enoent()
+  test(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %eq = icmp.eq i32 %c, 0
+    condbr %eq, found(geo, node, i, val), next(head, geo, key, val, node, i)
+  next(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(head, geo, key, val, node, %i1)
+  found(geo: ptr, node: ptr, i: i64, val: ptr):
+    %vv = call i64 klb_ptrval(val)
+    call void klb_setval(geo, node, i, %vv)
+    ret 0
+  enoent():
+    ret -2
+}
+
+fn klb_getpos(ptr, ptr, ptr) -> i64 {
+  entry(geo: ptr, node: ptr, key: ptr):
+    br scan(geo, node, key, 0)
+  scan(geo: ptr, node: ptr, key: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(geo, node, key, i), done(i)
+  test(geo: ptr, node: ptr, key: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %cz = sext i64 %c
+    %le = icmp.sle i64 %cz, 0
+    condbr %le, done(i), next(geo, node, key, i)
+  next(geo: ptr, node: ptr, key: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(geo, node, key, %i1)
+  done(i: i64):
+    ret i
+}
+
+fn klb_getfill(ptr, ptr, i64) -> i64 {
+  entry(geo: ptr, node: ptr, start: i64):
+    br scan(geo, node, start)
+  scan(geo: ptr, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(geo, node, i), done(i)
+  test(geo: ptr, node: ptr, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %z = icmp.eq i64 %bv, 0
+    condbr %z, done(i), next(geo, node, i)
+  next(geo: ptr, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(geo, node, %i1)
+  done(i: i64):
+    ret i
+}
+
+fn klb_find_level(ptr, ptr, ptr, i64) -> ptr {
+  entry(head: ptr, geo: ptr, key: ptr, level: i64):
+    %node0 = load ptr, head
+    %h = call i64 klb_head_height(head)
+    br descend(head, geo, key, level, %h, %node0)
+  descend(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr):
+    %gt = icmp.sgt i64 h, level
+    condbr %gt, scan(head, geo, key, level, h, node, 0), fin(node)
+  scan(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(head, geo, key, level, h, node, i), adjust(head, geo, key, level, h, node, i)
+  test(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %cz = sext i64 %c
+    %le = icmp.sle i64 %cz, 0
+    condbr %le, checkval(head, geo, key, level, h, node, i), next(head, geo, key, level, h, node, i)
+  next(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(head, geo, key, level, h, node, %i1)
+  checkval(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %z = icmp.eq i64 %bv, 0
+    condbr %z, adjust(head, geo, key, level, h, node, i), down(head, geo, key, level, h, node, i, %bv)
+  adjust(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i0: i64):
+    %i = sub i64 i0, 1
+    %neg = icmp.slt i64 %i, 0
+    condbr %neg, bug(), fixkey(head, geo, key, level, h, node, %i)
+  fixkey(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i: i64):
+    call void klb_setkey(geo, node, i, key)
+    %bv = call i64 klb_bval(geo, node, i)
+    br down(head, geo, key, level, h, node, i, %bv)
+  down(head: ptr, geo: ptr, key: ptr, level: i64, h: i64, node: ptr, i: i64, bv: i64):
+    %next = call ptr klb_fromval(bv)
+    %h1 = sub i64 h, 1
+    br descend(head, geo, key, level, %h1, %next)
+  fin(node: ptr):
+    %nv = call i64 klb_ptrval(node)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, bug(), ok(node)
+  ok(node: ptr):
+    ret node
+  bug():
+    call void klb_bug()
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn klb_grow(ptr, ptr, i64) -> i32 {
+  entry(head: ptr, geo: ptr, gfp: i64):
+    %node = call ptr klb_node_alloc(head, gfp)
+    %nv = call i64 klb_ptrval(%node)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, enomem(), have(head, geo, %node)
+  have(head: ptr, geo: ptr, node: ptr):
+    %old = load ptr, head
+    %ov = call i64 klb_ptrval(%old)
+    %nz = icmp.ne i64 %ov, 0
+    condbr %nz, fill(head, geo, node, %old), install(head, node)
+  fill(head: ptr, geo: ptr, node: ptr, old: ptr):
+    %f = call i64 klb_getfill(geo, old, 0)
+    %fm1 = sub i64 %f, 1
+    %src = call ptr klb_bkey(geo, old, %fm1)
+    call void klb_setkey(geo, node, 0, %src)
+    %ov = call i64 klb_ptrval(old)
+    call void klb_setval(geo, node, 0, %ov)
+    br install(head, node)
+  install(head: ptr, node: ptr):
+    store ptr %head, node
+    %h = call i64 klb_head_height(head)
+    %h1 = add i64 %h, 1
+    call void klb_set_height(head, %h1)
+    ret 0
+  enomem():
+    ret -12
+}
+
+fn klb_shrink(ptr, ptr) -> void {
+  entry(head: ptr, geo: ptr):
+    %h = call i64 klb_head_height(head)
+    %le = icmp.sle i64 %h, 1
+    condbr %le, done(), body(head, geo, %h)
+  body(head: ptr, geo: ptr, h: i64):
+    %node = load ptr, head
+    %f = call i64 klb_getfill(geo, %node, 0)
+    %gt = icmp.sgt i64 %f, 1
+    condbr %gt, bug(), shrink(head, geo, h, %node)
+  shrink(head: ptr, geo: ptr, h: i64, node: ptr):
+    %bv = call i64 klb_bval(geo, node, 0)
+    %child = call ptr klb_fromval(%bv)
+    store ptr %head, %child
+    %h1 = sub i64 h, 1
+    call void klb_set_height(head, %h1)
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    call void mempool_free(node, %pool)
+    br done()
+  bug():
+    call void klb_bug()
+    br done()
+  done():
+    ret
+}
+
+fn btree_get_prev(ptr, ptr, ptr) -> ptr {
+  entry(head: ptr, geo: ptr, ukey: ptr):
+    %kz = call i64 klb_keyzero(geo, ukey)
+    %nz = icmp.ne i64 %kz, 0
+    condbr %nz, nullret(), check(head, geo, ukey)
+  check(head: ptr, geo: ptr, ukey: ptr):
+    %h = call i64 klb_head_height(head)
+    %z = icmp.eq i64 %h, 0
+    condbr %z, nullret(), setup(head, geo, ukey)
+  setup(head: ptr, geo: ptr, ukey: ptr):
+    %sv0 = alloca 8, 8
+    %sv1 = alloca 8, 8
+    %w0 = load i64, ukey
+    store i64 %sv0, %w0
+    %kl = call i64 klb_keylen(geo)
+    %two = icmp.eq i64 %kl, 2
+    condbr %two, save2(head, geo, ukey, %sv0, %sv1), join(head, geo, ukey, %sv0, %sv1)
+  save2(head: ptr, geo: ptr, ukey: ptr, sv0: ptr, sv1: ptr):
+    %p = gep i8 ukey, 8
+    %w1 = load i64, %p
+    store i64 sv1, %w1
+    br join(head, geo, ukey, sv0, sv1)
+  join(head: ptr, geo: ptr, ukey: ptr, sv0: ptr, sv1: ptr):
+    %null = call ptr klb_null()
+    br retry(head, geo, ukey, ukey, %null, sv0, sv1)
+  retry(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr):
+    call void klb_dec_key(geo, key)
+    %node0 = load ptr, head
+    %h = call i64 klb_head_height(head)
+    br descend(head, geo, ukey, key, retry_key, sv0, sv1, %h, %node0)
+  descend(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, h: i64, node: ptr):
+    %gt = icmp.sgt i64 h, 1
+    condbr %gt, scan(head, geo, ukey, key, retry_key, sv0, sv1, h, node, 0), leafchk(head, geo, ukey, key, retry_key, sv0, sv1, node)
+  scan(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, h: i64, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(head, geo, ukey, key, retry_key, sv0, sv1, h, node, i), miss(head, geo, ukey, key, retry_key, sv0, sv1)
+  test(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, h: i64, node: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %cz = sext i64 %c
+    %le = icmp.sle i64 %cz, 0
+    condbr %le, follow(head, geo, ukey, key, retry_key, sv0, sv1, h, node, i), next(head, geo, ukey, key, retry_key, sv0, sv1, h, node, i)
+  next(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, h: i64, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br scan(head, geo, ukey, key, retry_key, sv0, sv1, h, node, %i1)
+  follow(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, h: i64, node: ptr, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %next = call ptr klb_fromval(%bv)
+    %nv = call i64 klb_ptrval(%next)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, miss(head, geo, ukey, key, retry_key, sv0, sv1), down(head, geo, ukey, key, sv0, sv1, h, %next, node, i)
+  down(head: ptr, geo: ptr, ukey: ptr, key: ptr, sv0: ptr, sv1: ptr, h: i64, next: ptr, oldnode: ptr, i: i64):
+    %rk = call ptr klb_bkey(geo, oldnode, i)
+    %h1 = sub i64 h, 1
+    br descend(head, geo, ukey, key, %rk, sv0, sv1, %h1, next)
+  leafchk(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, node: ptr):
+    %nv = call i64 klb_ptrval(node)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, miss(head, geo, ukey, key, retry_key, sv0, sv1), leafscan(head, geo, ukey, key, retry_key, sv0, sv1, node, 0)
+  leafscan(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, node: ptr, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, leaftest(head, geo, ukey, key, retry_key, sv0, sv1, node, i), miss(head, geo, ukey, key, retry_key, sv0, sv1)
+  leaftest(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, node: ptr, i: i64):
+    %c = call i32 klb_keycmp(geo, node, i, key)
+    %cz = sext i64 %c
+    %le = icmp.sle i64 %cz, 0
+    condbr %le, leafval(head, geo, ukey, key, retry_key, sv0, sv1, node, i), leafnext(head, geo, ukey, key, retry_key, sv0, sv1, node, i)
+  leafnext(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, node: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br leafscan(head, geo, ukey, key, retry_key, sv0, sv1, node, %i1)
+  leafval(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr, node: ptr, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %nz = icmp.ne i64 %bv, 0
+    condbr %nz, found(geo, ukey, node, i, %bv), miss(head, geo, ukey, key, retry_key, sv0, sv1)
+  found(geo: ptr, ukey: ptr, node: ptr, i: i64, bv: i64):
+    %src = call ptr klb_bkey(geo, node, i)
+    %kl = call i64 klb_keylen(geo)
+    %r = call ptr klb_longcpy(ukey, %src, %kl)
+    %ret = call ptr klb_fromval(bv)
+    ret %ret
+  miss(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr):
+    %rv = call i64 klb_ptrval(retry_key)
+    %nz = icmp.ne i64 %rv, 0
+    condbr %nz, doretry(head, geo, ukey, key, retry_key, sv0, sv1), restore(head, geo, ukey, sv0, sv1)
+  doretry(head: ptr, geo: ptr, ukey: ptr, key: ptr, retry_key: ptr, sv0: ptr, sv1: ptr):
+    %kl = call i64 klb_keylen(geo)
+    %r = call ptr klb_longcpy(key, retry_key, %kl)
+    %null = call ptr klb_null()
+    br retry(head, geo, ukey, key, %null, sv0, sv1)
+  restore(head: ptr, geo: ptr, ukey: ptr, sv0: ptr, sv1: ptr):
+    %w0 = load i64, sv0
+    store i64 ukey, %w0
+    %kl = call i64 klb_keylen(geo)
+    %two = icmp.eq i64 %kl, 2
+    condbr %two, restore2(ukey, sv1), nullret()
+  restore2(ukey: ptr, sv1: ptr):
+    %p = gep i8 ukey, 8
+    %w1 = load i64, sv1
+    store i64 %p, %w1
+    br nullret()
+  nullret():
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn klb_insert_level(ptr, ptr, ptr, ptr, i64, i64) -> i32 {
+  entry(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64):
+    %vv = call i64 klb_ptrval(val)
+    %z = icmp.eq i64 %vv, 0
+    condbr %z, bug(), heightchk(head, geo, key, val, level, gfp)
+  heightchk(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64):
+    %h = call i64 klb_head_height(head)
+    %lt = icmp.slt i64 %h, level
+    condbr %lt, grow(head, geo, key, val, level, gfp), retry(head, geo, key, val, level, gfp)
+  grow(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64):
+    %err = call i32 klb_grow(head, geo, gfp)
+    %nz = icmp.ne i32 %err, 0
+    condbr %nz, errret(%err), retry(head, geo, key, val, level, gfp)
+  retry(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64):
+    %node = call ptr klb_find_level(head, geo, key, level)
+    %pos = call i64 klb_getpos(geo, %node, key)
+    %fill = call i64 klb_getfill(geo, %node, %pos)
+    br dupchk(head, geo, key, val, level, gfp, %node, %pos, %fill)
+  dupchk(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, pos: i64, fill: i64):
+    %lt = icmp.slt i64 pos, fill
+    condbr %lt, dupcmp(head, geo, key, val, level, gfp, node, pos, fill), fullchk(head, geo, key, val, level, gfp, node, pos, fill)
+  dupcmp(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, pos: i64, fill: i64):
+    %c = call i32 klb_keycmp(geo, node, pos, key)
+    %eq = icmp.eq i32 %c, 0
+    condbr %eq, bug(), fullchk(head, geo, key, val, level, gfp, node, pos, fill)
+  fullchk(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, pos: i64, fill: i64):
+    %np = call i64 klb_nopairs(geo)
+    %eq = icmp.eq i64 fill, %np
+    condbr %eq, split(head, geo, key, val, level, gfp, node, pos, fill), insert(head, geo, key, val, node, pos, fill)
+  split(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, pos: i64, fill: i64):
+    %new = call ptr klb_node_alloc(head, gfp)
+    %nv = call i64 klb_ptrval(%new)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, enomem(), recurse(head, geo, key, val, level, gfp, node, %new, fill)
+  recurse(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, new: ptr, fill: i64):
+    %half = udiv i64 fill, 2
+    %hm1 = sub i64 %half, 1
+    %mk = call ptr klb_bkey(geo, node, %hm1)
+    %nv = call i64 klb_ptrval(new)
+    %newp = call ptr klb_fromval(%nv)
+    %l1 = add i64 level, 1
+    %err = call i32 klb_insert_level(head, geo, %mk, %newp, %l1, gfp)
+    %nz = icmp.ne i32 %err, 0
+    condbr %nz, recerr(head, %new, %err), moveloop(head, geo, key, val, level, gfp, node, new, fill, 0)
+  recerr(head: ptr, new: ptr, err: i32):
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    call void mempool_free(new, %pool)
+    br errret(err)
+  moveloop(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, new: ptr, fill: i64, i: i64):
+    %half = udiv i64 fill, 2
+    %lt = icmp.slt i64 i, %half
+    condbr %lt, movebody(head, geo, key, val, level, gfp, node, new, fill, i), moveodd(head, geo, key, val, level, gfp, node, fill)
+  movebody(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, new: ptr, fill: i64, i: i64):
+    %half = udiv i64 fill, 2
+    %src1 = call ptr klb_bkey(geo, node, i)
+    call void klb_setkey(geo, new, i, %src1)
+    %bv1 = call i64 klb_bval(geo, node, i)
+    call void klb_setval(geo, new, i, %bv1)
+    %si = add i64 i, %half
+    %src2 = call ptr klb_bkey(geo, node, %si)
+    call void klb_setkey(geo, node, i, %src2)
+    %bv2 = call i64 klb_bval(geo, node, %si)
+    call void klb_setval(geo, node, i, %bv2)
+    call void klb_clearpair(geo, node, %si)
+    %i1 = add i64 i, 1
+    br moveloop(head, geo, key, val, level, gfp, node, new, fill, %i1)
+  moveodd(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, fill: i64):
+    %odd = and i64 fill, 1
+    %nz = icmp.ne i64 %odd, 0
+    condbr %nz, oddbody(head, geo, key, val, level, gfp, node, fill), retry(head, geo, key, val, level, gfp)
+  oddbody(head: ptr, geo: ptr, key: ptr, val: ptr, level: i64, gfp: i64, node: ptr, fill: i64):
+    %half = udiv i64 fill, 2
+    %fm1 = sub i64 fill, 1
+    %src = call ptr klb_bkey(geo, node, %fm1)
+    call void klb_setkey(geo, node, %half, %src)
+    %bv = call i64 klb_bval(geo, node, %fm1)
+    call void klb_setval(geo, node, %half, %bv)
+    call void klb_clearpair(geo, node, %fm1)
+    br retry(head, geo, key, val, level, gfp)
+  insert(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, pos: i64, fill: i64):
+    %np = call i64 klb_nopairs(geo)
+    %ge = icmp.sge i64 fill, %np
+    condbr %ge, bug(), shift(head, geo, key, val, node, pos, fill, fill)
+  shift(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, pos: i64, fill: i64, i: i64):
+    %gt = icmp.sgt i64 i, pos
+    condbr %gt, shiftbody(head, geo, key, val, node, pos, fill, i), place(head, geo, key, val, node, pos)
+  shiftbody(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, pos: i64, fill: i64, i: i64):
+    %im1 = sub i64 i, 1
+    %src = call ptr klb_bkey(geo, node, %im1)
+    call void klb_setkey(geo, node, i, %src)
+    %bv = call i64 klb_bval(geo, node, %im1)
+    call void klb_setval(geo, node, i, %bv)
+    br shift(head, geo, key, val, node, pos, fill, %im1)
+  place(head: ptr, geo: ptr, key: ptr, val: ptr, node: ptr, pos: i64):
+    call void klb_setkey(geo, node, pos, key)
+    %vv = call i64 klb_ptrval(val)
+    call void klb_setval(geo, node, pos, %vv)
+    ret 0
+  enomem():
+    ret -12
+  errret(err: i32):
+    ret err
+  bug():
+    call void klb_bug()
+    ret 0
+}
+
+fn btree_insert(ptr, ptr, ptr, ptr, i64) -> i32 {
+  entry(head: ptr, geo: ptr, key: ptr, val: ptr, gfp: i64):
+    %vv = call i64 klb_ptrval(val)
+    %z = icmp.eq i64 %vv, 0
+    condbr %z, bug(), go(head, geo, key, val, gfp)
+  go(head: ptr, geo: ptr, key: ptr, val: ptr, gfp: i64):
+    %r = call i32 klb_insert_level(head, geo, key, val, 1, gfp)
+    ret %r
+  bug():
+    call void klb_bug()
+    ret 0
+}
+
+fn klb_merge_nodes(ptr, ptr, i64, ptr, i64, ptr, i64, ptr, i64) -> void {
+  entry(head: ptr, geo: ptr, level: i64, left: ptr, lfill: i64, right: ptr, rfill: i64, parent: ptr, lpos: i64):
+    br loop(head, geo, level, left, lfill, right, rfill, parent, lpos, 0)
+  loop(head: ptr, geo: ptr, level: i64, left: ptr, lfill: i64, right: ptr, rfill: i64, parent: ptr, lpos: i64, i: i64):
+    %lt = icmp.slt i64 i, rfill
+    condbr %lt, body(head, geo, level, left, lfill, right, rfill, parent, lpos, i), swap(head, geo, level, left, right, parent, lpos)
+  body(head: ptr, geo: ptr, level: i64, left: ptr, lfill: i64, right: ptr, rfill: i64, parent: ptr, lpos: i64, i: i64):
+    %dst = add i64 lfill, i
+    %src = call ptr klb_bkey(geo, right, i)
+    call void klb_setkey(geo, left, %dst, %src)
+    %bv = call i64 klb_bval(geo, right, i)
+    call void klb_setval(geo, left, %dst, %bv)
+    %i1 = add i64 i, 1
+    br loop(head, geo, level, left, lfill, right, rfill, parent, lpos, %i1)
+  swap(head: ptr, geo: ptr, level: i64, left: ptr, right: ptr, parent: ptr, lpos: i64):
+    %rv = call i64 klb_ptrval(right)
+    call void klb_setval(geo, parent, lpos, %rv)
+    %lp1 = add i64 lpos, 1
+    %lv = call i64 klb_ptrval(left)
+    call void klb_setval(geo, parent, %lp1, %lv)
+    %k = call ptr klb_bkey(geo, parent, lpos)
+    %l1 = add i64 level, 1
+    %r = call ptr klb_remove_level(head, geo, %k, %l1)
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    call void mempool_free(right, %pool)
+    ret
+}
+
+fn klb_rebalance(ptr, ptr, ptr, i64, ptr, i64) -> void {
+  entry(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr, fill: i64):
+    %z = icmp.eq i64 fill, 0
+    condbr %z, emptycase(head, geo, key, level, child), findpar(head, geo, key, level, child, fill)
+  emptycase(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr):
+    %l1 = add i64 level, 1
+    %r = call ptr klb_remove_level(head, geo, key, %l1)
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    call void mempool_free(child, %pool)
+    ret
+  findpar(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr, fill: i64):
+    %l1 = add i64 level, 1
+    %parent = call ptr klb_find_level(head, geo, key, %l1)
+    %i = call i64 klb_getpos(geo, %parent, key)
+    %bv = call i64 klb_bval(geo, %parent, %i)
+    %cv = call i64 klb_ptrval(child)
+    %ne = icmp.ne i64 %bv, %cv
+    condbr %ne, bug(), leftchk(head, geo, key, level, child, fill, %parent, %i)
+  leftchk(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr, fill: i64, parent: ptr, i: i64):
+    %gt = icmp.sgt i64 i, 0
+    condbr %gt, lefttry(head, geo, key, level, child, fill, parent, i), rightchk(head, geo, key, level, child, fill, parent, i)
+  lefttry(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr, fill: i64, parent: ptr, i: i64):
+    %im1 = sub i64 i, 1
+    %bv = call i64 klb_bval(geo, parent, %im1)
+    %left = call ptr klb_fromval(%bv)
+    %noleft = call i64 klb_getfill(geo, %left, 0)
+    %sum = add i64 fill, %noleft
+    %np = call i64 klb_nopairs(geo)
+    %le = icmp.sle i64 %sum, %np
+    condbr %le, domergeleft(head, geo, level, child, fill, parent, i, %left, %noleft), rightchk(head, geo, key, level, child, fill, parent, i)
+  domergeleft(head: ptr, geo: ptr, level: i64, child: ptr, fill: i64, parent: ptr, i: i64, left: ptr, noleft: i64):
+    %im1 = sub i64 i, 1
+    call void klb_merge_nodes(head, geo, level, left, noleft, child, fill, parent, %im1)
+    ret
+  rightchk(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr, fill: i64, parent: ptr, i: i64):
+    %ip1 = add i64 i, 1
+    %f = call i64 klb_getfill(geo, parent, i)
+    %lt = icmp.slt i64 %ip1, %f
+    condbr %lt, righttry(head, geo, key, level, child, fill, parent, i), done()
+  righttry(head: ptr, geo: ptr, key: ptr, level: i64, child: ptr, fill: i64, parent: ptr, i: i64):
+    %ip1 = add i64 i, 1
+    %bv = call i64 klb_bval(geo, parent, %ip1)
+    %right = call ptr klb_fromval(%bv)
+    %noright = call i64 klb_getfill(geo, %right, 0)
+    %sum = add i64 fill, %noright
+    %np = call i64 klb_nopairs(geo)
+    %le = icmp.sle i64 %sum, %np
+    condbr %le, domergeright(head, geo, level, child, fill, parent, i, %right, %noright), done()
+  domergeright(head: ptr, geo: ptr, level: i64, child: ptr, fill: i64, parent: ptr, i: i64, right: ptr, noright: i64):
+    call void klb_merge_nodes(head, geo, level, child, fill, right, noright, parent, i)
+    ret
+  bug():
+    call void klb_bug()
+    ret
+  done():
+    ret
+}
+
+fn klb_remove_level(ptr, ptr, ptr, i64) -> ptr {
+  entry(head: ptr, geo: ptr, key: ptr, level: i64):
+    %h = call i64 klb_head_height(head)
+    %gt = icmp.sgt i64 level, %h
+    condbr %gt, wipe(head), find(head, geo, key, level)
+  wipe(head: ptr):
+    %hp = gep i8 head, 16
+    store i32 %hp, 0
+    %null = call ptr klb_null()
+    store ptr %head, %null
+    ret %null
+  find(head: ptr, geo: ptr, key: ptr, level: i64):
+    %node = call ptr klb_find_level(head, geo, key, level)
+    %pos = call i64 klb_getpos(geo, %node, key)
+    %fill = call i64 klb_getfill(geo, %node, %pos)
+    br keychk(head, geo, key, level, %node, %pos, %fill)
+  keychk(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, pos: i64, fill: i64):
+    %is1 = icmp.eq i64 level, 1
+    condbr %is1, cmpchk(head, geo, key, level, node, pos, fill), remove(head, geo, key, level, node, pos, fill)
+  cmpchk(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, pos: i64, fill: i64):
+    %c = call i32 klb_keycmp(geo, node, pos, key)
+    %ne = icmp.ne i32 %c, 0
+    condbr %ne, nullret(), remove(head, geo, key, level, node, pos, fill)
+  remove(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, pos: i64, fill: i64):
+    %bv = call i64 klb_bval(geo, node, pos)
+    %ret = call ptr klb_fromval(%bv)
+    %fm1 = sub i64 fill, 1
+    br shift(head, geo, key, level, node, pos, fill, pos, %ret)
+  shift(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, pos: i64, fill: i64, i: i64, ret: ptr):
+    %fm1 = sub i64 fill, 1
+    %lt = icmp.slt i64 i, %fm1
+    condbr %lt, shiftbody(head, geo, key, level, node, pos, fill, i, ret), clear(head, geo, key, level, node, fill, ret)
+  shiftbody(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, pos: i64, fill: i64, i: i64, ret: ptr):
+    %ip1 = add i64 i, 1
+    %src = call ptr klb_bkey(geo, node, %ip1)
+    call void klb_setkey(geo, node, i, %src)
+    %bv = call i64 klb_bval(geo, node, %ip1)
+    call void klb_setval(geo, node, i, %bv)
+    br shift(head, geo, key, level, node, pos, fill, %ip1, ret)
+  clear(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, fill: i64, ret: ptr):
+    %fm1 = sub i64 fill, 1
+    call void klb_clearpair(geo, node, %fm1)
+    %np = call i64 klb_nopairs(geo)
+    %half = udiv i64 %np, 2
+    %lt = icmp.slt i64 %fm1, %half
+    condbr %lt, underfull(head, geo, key, level, node, %fm1, ret), done(ret)
+  underfull(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, fm1: i64, ret: ptr):
+    %h = call i64 klb_head_height(head)
+    %lt = icmp.slt i64 level, %h
+    condbr %lt, reb(head, geo, key, level, node, fm1, ret), shrinkchk(head, geo, fm1, ret)
+  reb(head: ptr, geo: ptr, key: ptr, level: i64, node: ptr, fm1: i64, ret: ptr):
+    call void klb_rebalance(head, geo, key, level, node, fm1)
+    br done(ret)
+  shrinkchk(head: ptr, geo: ptr, fm1: i64, ret: ptr):
+    %eq = icmp.eq i64 fm1, 1
+    condbr %eq, shrink(head, geo, ret), done(ret)
+  shrink(head: ptr, geo: ptr, ret: ptr):
+    call void klb_shrink(head, geo)
+    br done(ret)
+  done(ret: ptr):
+    ret ret
+  nullret():
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn btree_remove(ptr, ptr, ptr) -> ptr {
+  entry(head: ptr, geo: ptr, key: ptr):
+    %h = call i64 klb_head_height(head)
+    %z = icmp.eq i64 %h, 0
+    condbr %z, nullret(), go(head, geo, key)
+  go(head: ptr, geo: ptr, key: ptr):
+    %r = call ptr klb_remove_level(head, geo, key, 1)
+    ret %r
+  nullret():
+    %null = call ptr klb_null()
+    ret %null
+}
+
+fn btree_merge(ptr, ptr, ptr, i64) -> i32 {
+  entry(target: ptr, victim: ptr, geo: ptr, gfp: i64):
+    %tv = call i64 klb_ptrval(target)
+    %vv = call i64 klb_ptrval(victim)
+    %eq = icmp.eq i64 %tv, %vv
+    condbr %eq, bug(), emptychk(target, victim, geo, gfp)
+  emptychk(target: ptr, victim: ptr, geo: ptr, gfp: i64):
+    %node = load ptr, target
+    %nv = call i64 klb_ptrval(%node)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, take(target, victim), start(target, victim, geo, gfp)
+  take(target: ptr, victim: ptr):
+    %node = load ptr, victim
+    store ptr %target, %node
+    %vh = call i64 klb_head_height(victim)
+    call void klb_set_height(target, %vh)
+    call void klb_init_head(victim)
+    ret 0
+  start(target: ptr, victim: ptr, geo: ptr, gfp: i64):
+    %scratch = call ptr klb_node_alloc(target, gfp)
+    %sv = call i64 klb_ptrval(%scratch)
+    %z = icmp.eq i64 %sv, 0
+    condbr %z, enomem(), loop(target, victim, geo, gfp, %scratch)
+  loop(target: ptr, victim: ptr, geo: ptr, gfp: i64, scratch: ptr):
+    %val = call ptr btree_last(victim, geo, scratch)
+    %vv = call i64 klb_ptrval(%val)
+    %z = icmp.eq i64 %vv, 0
+    condbr %z, done(target, scratch), insert(target, victim, geo, gfp, scratch, %val)
+  insert(target: ptr, victim: ptr, geo: ptr, gfp: i64, scratch: ptr, val: ptr):
+    %err = call i32 btree_insert(target, geo, scratch, val, gfp)
+    %nz = icmp.ne i32 %err, 0
+    condbr %nz, errfree(target, scratch, %err), remove(target, victim, geo, gfp, scratch)
+  remove(target: ptr, victim: ptr, geo: ptr, gfp: i64, scratch: ptr):
+    %kl = call i64 klb_keylen(geo)
+    %dup = gep i8 scratch, 16
+    %r = call ptr klb_longcpy(%dup, scratch, %kl)
+    %rv = call ptr btree_remove(victim, geo, %dup)
+    br loop(target, victim, geo, gfp, scratch)
+  done(target: ptr, scratch: ptr):
+    %pp = gep i8 target, 8
+    %pool = load ptr, %pp
+    call void mempool_free(scratch, %pool)
+    ret 0
+  errfree(target: ptr, scratch: ptr, err: i32):
+    %pp = gep i8 target, 8
+    %pool = load ptr, %pp
+    call void mempool_free(scratch, %pool)
+    ret err
+  enomem():
+    ret -12
+  bug():
+    call void klb_bug()
+    ret 0
+}
+
+fn klb_for_each(ptr, ptr, ptr, i64, ptr, ptr, i64, i64, i64) -> i64 {
+  entry(head: ptr, geo: ptr, node: ptr, opaque: i64, func: ptr, func2: ptr, reap: i64, height: i64, count: i64):
+    br scan(head, geo, node, opaque, func, func2, reap, height, count, 0)
+  scan(head: ptr, geo: ptr, node: ptr, opaque: i64, func: ptr, func2: ptr, reap: i64, height: i64, count: i64, i: i64):
+    %np = call i64 klb_nopairs(geo)
+    %lt = icmp.slt i64 i, %np
+    condbr %lt, test(head, geo, node, opaque, func, func2, reap, height, count, i), fin(head, node, reap, count)
+  test(head: ptr, geo: ptr, node: ptr, opaque: i64, func: ptr, func2: ptr, reap: i64, height: i64, count: i64, i: i64):
+    %bv = call i64 klb_bval(geo, node, i)
+    %z = icmp.eq i64 %bv, 0
+    condbr %z, fin(head, node, reap, count), visit(head, geo, node, opaque, func, func2, reap, height, count, i, %bv)
+  visit(head: ptr, geo: ptr, node: ptr, opaque: i64, func: ptr, func2: ptr, reap: i64, height: i64, count: i64, i: i64, bv: i64):
+    %gt = icmp.sgt i64 height, 1
+    condbr %gt, down(head, geo, node, opaque, func, func2, reap, height, count, i, bv), callfn(head, geo, node, opaque, func, func2, reap, height, count, i, bv)
+  down(head: ptr, geo: ptr, node: ptr, opaque: i64, func: ptr, func2: ptr, reap: i64, height: i64, count: i64, i: i64, bv: i64):
+    %child = call ptr klb_fromval(bv)
+    %hm1 = sub i64 height, 1
+    %c2 = call i64 klb_for_each(head, geo, %child, opaque, func, func2, reap, %hm1, count)
+    %i1 = add i64 i, 1
+    br scan(head, geo, node, opaque, func, func2, reap, height, %c2, %i1)
+  callfn(head: ptr, geo: ptr, node: ptr, opaque: i64, func: ptr, func2: ptr, reap: i64, height: i64, count: i64, i: i64, bv: i64):
+    %child = call ptr klb_fromval(bv)
+    %k = call ptr klb_bkey(geo, node, i)
+    call void klb_call_visitor(%func, %child, opaque, %k, count, func2)
+    %c2 = add i64 count, 1
+    %i1 = add i64 i, 1
+    br scan(head, geo, node, opaque, func, func2, reap, height, %c2, %i1)
+  fin(head: ptr, node: ptr, reap: i64, count: i64):
+    %nz = icmp.ne i64 reap, 0
+    condbr %nz, reapfree(head, node, count), done(count)
+  reapfree(head: ptr, node: ptr, count: i64):
+    %pp = gep i8 head, 8
+    %pool = load ptr, %pp
+    call void mempool_free(node, %pool)
+    br done(count)
+  done(count: i64):
+    ret count
+}
+
+fn klb_empty(ptr, i64, ptr, i64, ptr) -> void {
+  entry(elem: ptr, opaque: i64, key: ptr, index: i64, func2: ptr):
+    ret
+}
+
+fn visitorl(ptr, i64, ptr, i64, ptr) -> void {
+  entry(elem: ptr, opaque: i64, key: ptr, index: i64, func: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, func
+    %k = load i64, key
+    call void klb_call_visitorl(%slot, elem, opaque, %k, index)
+    ret
+}
+
+fn visitor32(ptr, i64, ptr, i64, ptr) -> void {
+  entry(elem: ptr, opaque: i64, key: ptr, index: i64, func: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, func
+    %k32 = load i32, key
+    call void klb_call_visitor32(%slot, elem, opaque, %k32, index)
+    ret
+}
+
+fn visitor64(ptr, i64, ptr, i64, ptr) -> void {
+  entry(elem: ptr, opaque: i64, key: ptr, index: i64, func: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, func
+    %k = load i64, key
+    call void klb_call_visitor64(%slot, elem, opaque, %k, index)
+    ret
+}
+
+fn visitor128(ptr, i64, ptr, i64, ptr) -> void {
+  entry(elem: ptr, opaque: i64, key: ptr, index: i64, func: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, func
+    %k0 = load i64, key
+    %p1 = gep i8 key, 8
+    %k1 = load i64, %p1
+    call void klb_call_visitor128(%slot, elem, opaque, %k0, %k1, index)
+    ret
+}
+
+fn btree_visitor(ptr, ptr, i64, ptr, ptr) -> i64 {
+  entry(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr):
+    %f2v = call i64 klb_ptrval(func2)
+    %z = icmp.eq i64 %f2v, 0
+    condbr %z, emptyfn(head, geo, opaque, func2), havefn(head, geo, opaque, func, func2)
+  emptyfn(head: ptr, geo: ptr, opaque: i64, func2: ptr):
+    %f = funcptr klb_empty
+    br run(head, geo, opaque, %f, func2)
+  havefn(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr):
+    br run(head, geo, opaque, func, func2)
+  run(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr):
+    %node = load ptr, head
+    %nv = call i64 klb_ptrval(%node)
+    %nz = icmp.ne i64 %nv, 0
+    condbr %nz, walk(head, geo, opaque, func, func2, %node), zero()
+  walk(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr, node: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, func
+    %h = call i64 klb_head_height(head)
+    %c = call i64 klb_for_each(head, geo, node, opaque, %slot, func2, 0, %h, 0)
+    ret %c
+  zero():
+    ret 0
+}
+
+fn btree_grim_visitor(ptr, ptr, i64, ptr, ptr) -> i64 {
+  entry(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr):
+    %f2v = call i64 klb_ptrval(func2)
+    %z = icmp.eq i64 %f2v, 0
+    condbr %z, emptyfn(head, geo, opaque, func2), havefn(head, geo, opaque, func, func2)
+  emptyfn(head: ptr, geo: ptr, opaque: i64, func2: ptr):
+    %f = funcptr klb_empty
+    br run(head, geo, opaque, %f, func2)
+  havefn(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr):
+    br run(head, geo, opaque, func, func2)
+  run(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr):
+    %node = load ptr, head
+    %nv = call i64 klb_ptrval(%node)
+    %nz = icmp.ne i64 %nv, 0
+    condbr %nz, walk(head, geo, opaque, func, func2, %node), fin(head, 0)
+  walk(head: ptr, geo: ptr, opaque: i64, func: ptr, func2: ptr, node: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, func
+    %h = call i64 klb_head_height(head)
+    %c = call i64 klb_for_each(head, geo, node, opaque, %slot, func2, 1, %h, 0)
+    br fin(head, %c)
+  fin(head: ptr, count: i64):
+    call void klb_init_head(head)
+    ret count
+}

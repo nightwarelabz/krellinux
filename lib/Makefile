@@ -358,12 +358,12 @@ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
 # in tools/converge/rig/ before it is recorded in CONVERSION.md.
 KRELLC ?= krellc
 obj-y += krell_phase1_check.o krell_string_check.o krell_batch4_check.o \
-	 krell_batch5_check.o krell_batch6_check.o \
+	 krell_batch5_check.o krell_batch6_check.o krell_batch7_check.o \
 	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
 	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o \
 	 string_krell.o kstrtox_krell.o cmdline_krell.o bsearch_krell.o \
 	 find_bit_krell.o bitmap_krell.o bitmap-str_krell.o \
-	 sort_krell.o list_sort_krell.o
+	 sort_krell.o list_sort_krell.o btree_krell.o assoc_array_krell.o
 
 krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
@@ -487,7 +487,33 @@ krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\bsort_r\b/krell_sort_r/g' \
 	-e 's/\bsort_nonatomic\b/krell_sort_nonatomic/g' \
 	-e 's/\bsort\b/krell_sort/g' \
-	-e 's/\blist_sort\b/krell_list_sort/g'
+	-e 's/\blist_sort\b/krell_list_sort/g' \
+	-e 's/\bbtree_init_mempool\b/krell_btree_init_mempool/g' \
+	-e 's/\bassoc_array_insert_set_object\b/krell_assoc_array_insert_set_object/g' \
+	-e 's/\bassoc_array_insert\b/krell_assoc_array_insert/g' \
+	-e 's/\bassoc_array_iterate\b/krell_assoc_array_iterate/g' \
+	-e 's/\bassoc_array_destroy\b/krell_assoc_array_destroy/g' \
+	-e 's/\bassoc_array_delete\b/krell_assoc_array_delete/g' \
+	-e 's/\bassoc_array_clear\b/krell_assoc_array_clear/g' \
+	-e 's/\bassoc_array_apply_edit\b/krell_assoc_array_apply_edit/g' \
+	-e 's/\bassoc_array_cancel_edit\b/krell_assoc_array_cancel_edit/g' \
+	-e 's/\bassoc_array_find\b/krell_assoc_array_find/g' \
+	-e 's/\bassoc_array_gc\b/krell_assoc_array_gc/g' \
+	-e 's/\bbtree_grim_visitor\b/krell_btree_grim_visitor/g' \
+	-e 's/\bbtree_get_prev\b/krell_btree_get_prev/g' \
+	-e 's/\bbtree_destroy\b/krell_btree_destroy/g' \
+	-e 's/\bbtree_lookup\b/krell_btree_lookup/g' \
+	-e 's/\bbtree_update\b/krell_btree_update/g' \
+	-e 's/\bbtree_insert\b/krell_btree_insert/g' \
+	-e 's/\bbtree_remove\b/krell_btree_remove/g' \
+	-e 's/\bbtree_merge\b/krell_btree_merge/g' \
+	-e 's/\bbtree_visitor\b/krell_btree_visitor/g' \
+	-e 's/\bbtree_last\b/krell_btree_last/g' \
+	-e 's/\bbtree_init\b/krell_btree_init/g' \
+	-e 's/\bvisitor128\b/krell_visitor128/g' \
+	-e 's/\bvisitor32\b/krell_visitor32/g' \
+	-e 's/\bvisitor64\b/krell_visitor64/g' \
+	-e 's/\bvisitorl\b/krell_visitorl/g'
 
 $(obj)/%_krell.krel: $(src)/%.krell FORCE
 	$(Q)$(KRELLC) parse $< -o $@

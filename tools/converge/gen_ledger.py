@@ -150,6 +150,48 @@ OVERRIDES = {
         "boolean comparators; Krell object linked into "
         "vmlinux and self-checked at boot (Phase 1 batch 6). "
         "The C file still provides the symbol."),
+    "lib/btree.c": (
+        "KRELL (functions)",
+        "16 of 18 functions rewritten in Krell (lib/btree.krell): "
+        "btree_init_mempool, btree_init, btree_destroy, btree_last, "
+        "btree_lookup, btree_update, btree_get_prev, btree_insert, "
+        "btree_remove, btree_merge, visitorl/32/64/128, "
+        "btree_visitor and btree_grim_visitor, with the recursive "
+        "helpers carried as internal functions. Residue: "
+        "btree_alloc and btree_free stay C (they alone touch the "
+        "file-local btree_cachep); the Krell form reaches them as "
+        "externs, and btree_init passes their addresses to "
+        "mempool_create. The C implementation's separator keys "
+        "are hints that find_level rewrites on descent, and "
+        "btree_get_prev wraps to the largest key below the "
+        "smallest key's predecessor; the Krell form reproduces "
+        "both behaviours operation for operation (get_prev works "
+        "in place on the caller's key buffer, saving and "
+        "restoring it on the NULL path, as Krell data blobs are "
+        "constants). Differential rig vs the C original: 969,563 "
+        "cases, 0 divergence, with identical mempool alloc/free "
+        "accounting; Krell object linked into vmlinux and "
+        "self-checked at boot (Phase 1 batch 7). The C file "
+        "still provides the symbols."),
+    "lib/assoc_array.c": (
+        "KRELL (functions)",
+        "All 10 exported functions and all 8 file-local helpers "
+        "rewritten in Krell (lib/assoc_array.krell): "
+        "assoc_array_iterate, assoc_array_find, "
+        "assoc_array_destroy, assoc_array_insert, "
+        "assoc_array_insert_set_object, assoc_array_delete, "
+        "assoc_array_clear, assoc_array_apply_edit, "
+        "assoc_array_cancel_edit and assoc_array_gc. Tagged "
+        "pointers travel as i64 bit patterns end to end; the ops "
+        "callbacks and iterators are reached through helpers that "
+        "load the target from memory at the call site, and C "
+        "bool callback results are normalised through the low "
+        "byte. READ_ONCE sites use volatile loads and the "
+        "smp_wmb in apply_edit is a release fence. Differential "
+        "rig vs the C original: 41,843 cases, 0 divergence, "
+        "with identical allocation totals by size; Krell object "
+        "linked into vmlinux and self-checked at boot (Phase 1 "
+        "batch 7). The C file still provides the symbols."),
     "lib/bitmap-str.c": (
         "KRELL (functions)",
         "All 6 exported functions rewritten in Krell "

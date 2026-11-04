@@ -112,6 +112,44 @@ OVERRIDES = {
         "bitmap_from/to_arr64 are compiled only when "
         "BITS_PER_LONG == 32 and have no x86_64 instance. The C "
         "file still provides the symbols."),
+    "lib/sort.c": (
+        "KRELL (functions)",
+        "All 4 exported functions rewritten in Krell "
+        "(lib/sort.krell): sort_r, sort_r_nonatomic, sort and "
+        "sort_nonatomic over the bottom-up heapsort, operation "
+        "for operation. The sentinel dispatch (SWAP_WORDS_64/32, "
+        "SWAP_BYTES, SWAP_WRAPPER, _CMP_WRAPPER) is reproduced "
+        "by reading the function pointers as integers through "
+        "the alloca bridge; sort()/sort_nonatomic() pass their "
+        "wrapper's two fields as separate internal arguments "
+        "instead of a stack struct (nothing outside sort.c can "
+        "observe it), while sort_r() callers using the wrapper "
+        "sentinel get the pointers loaded from their priv "
+        "struct on every use, as in C. cond_resched() compiles "
+        "to nothing under this tree's configuration, so the "
+        "may_schedule flag is plumbed but empty, exactly as in "
+        "the C object. Differential rig vs the C original: "
+        "part of the batch 6 rig (11,143 cases across the "
+        "batch, 0 divergence), including swap-call counts "
+        "through counting swap functions; Krell object linked "
+        "into vmlinux and self-checked at boot (Phase 1 "
+        "batch 6). The C file still provides the symbols."),
+    "lib/list_sort.c": (
+        "KRELL (function)",
+        "list_sort() rewritten in Krell (lib/list_sort.krell) "
+        "with its merge and merge_final helpers, operation for "
+        "operation, including the stability rule (on equality "
+        "take from the first list). C's pointer-to-pointer "
+        "walks become plain addresses (next is at offset 0, "
+        "prev at offset 8 in struct list_head); the address "
+        "of the pending head uses an 8-byte alloca slot. "
+        "Differential rig vs the C original: part of the "
+        "batch 6 rig (11,143 cases across the batch, 0 "
+        "divergence), comparing forward and backward walks "
+        "and circular closure, with both three-way and "
+        "boolean comparators; Krell object linked into "
+        "vmlinux and self-checked at boot (Phase 1 batch 6). "
+        "The C file still provides the symbol."),
     "lib/bitmap-str.c": (
         "KRELL (functions)",
         "All 6 exported functions rewritten in Krell "

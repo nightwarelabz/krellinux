@@ -1,0 +1,370 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/sort.c converted to Krell (Phase 1 batch 6).
+;
+; The heapsort is the C algorithm operation for operation.
+; Internal plumbing differs where C's mechanism cannot be
+; named in Krell:
+; - The cmp/swap function pointers are also read as integers
+;   (alloca bridge) because C dispatches on the sentinel
+;   values 0/1/2/3 (SWAP_WORDS_64/32, SWAP_BYTES,
+;   SWAP_WRAPPER) and 0 (_CMP_WRAPPER).
+; - sort()/sort_nonatomic() build a struct wrapper on the
+;   stack in C and pass its address as priv.  Here the two
+;   function pointers travel as separate internal arguments
+;   (cmp mode 1 / swap mode 4); nothing outside sort.c can
+;   observe the struct.  sort_r() callers that pass the
+;   wrapper sentinel get the faithful treatment: the
+;   pointers are loaded from the caller's priv struct on
+;   every use (cmp mode 2 / swap mode 5), as in C.
+; - cond_resched() compiles to nothing in this tree's
+;   configuration (CONFIG_PREEMPTION=y makes _cond_resched()
+;   a stub returning 0, and __might_resched is compiled
+;   out; the C object references no resched symbol), so
+;   the may_schedule argument is plumbed through but the
+;   call is empty, exactly as in the C build.
+; - is_aligned() ignores the base pointer under
+;   CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS (x86_64), as
+;   in C.
+;
+; cmp modes:  0 = direct cmp_r pointer, 1 = fixed cmp
+;   pointer (from sort), 2 = wrapper cmp loaded from priv.
+; swap modes: 0 = swap_words_64, 1 = swap_words_32,
+;   2 = swap_bytes, 3 = direct swap_r pointer,
+;   4 = fixed swap pointer (from sort), 5 = wrapper swap
+;   loaded from priv.
+
+sig kls_cmp_r(ptr, ptr, ptr) -> i32
+sig kls_cmp(ptr, ptr) -> i32
+sig kls_swap_r(ptr, ptr, i32, ptr) -> void
+sig kls_swap(ptr, ptr, i32) -> void
+
+fn kls_ptrval(ptr) -> i64 {
+  entry(p: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    store ptr %slot, p
+    %v = load i64, %slot
+    ret %v
+}
+
+fn kls_swap_words_64(ptr, ptr, i64) -> void {
+  entry(a: ptr, b: ptr, n0: i64):
+    br loop(a, b, n0)
+  loop(a: ptr, b: ptr, n: i64):
+    %n1 = sub i64 n, 8
+    %pa = gep i8 a, %n1
+    %ta = load i64, %pa
+    %pb = gep i8 b, %n1
+    %tb = load i64, %pb
+    store i64 %pa, %tb
+    store i64 %pb, %ta
+    %nz = icmp.ne i64 %n1, 0
+    condbr %nz, loop(a, b, %n1), done()
+  done():
+    ret
+}
+
+fn kls_swap_words_32(ptr, ptr, i64) -> void {
+  entry(a: ptr, b: ptr, n0: i64):
+    br loop(a, b, n0)
+  loop(a: ptr, b: ptr, n: i64):
+    %n1 = sub i64 n, 4
+    %pa = gep i8 a, %n1
+    %ta = load i32, %pa
+    %pb = gep i8 b, %n1
+    %tb = load i32, %pb
+    store i32 %pa, %tb
+    store i32 %pb, %ta
+    %nz = icmp.ne i64 %n1, 0
+    condbr %nz, loop(a, b, %n1), done()
+  done():
+    ret
+}
+
+fn kls_swap_bytes(ptr, ptr, i64) -> void {
+  entry(a: ptr, b: ptr, n0: i64):
+    br loop(a, b, n0)
+  loop(a: ptr, b: ptr, n: i64):
+    %n1 = sub i64 n, 1
+    %pa = gep i8 a, %n1
+    %ta = load i8, %pa
+    %pb = gep i8 b, %n1
+    %tb = load i8, %pb
+    store i8 %pa, %tb
+    store i8 %pb, %ta
+    %nz = icmp.ne i64 %n1, 0
+    condbr %nz, loop(a, b, %n1), done()
+  done():
+    ret
+}
+
+; do_cmp: cmpmode selects how the comparator is reached.
+fn kls_do_cmp(ptr, ptr, i64, ptr, ptr, ptr) -> i32 {
+  entry(a: ptr, b: ptr, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, priv: ptr):
+    %m0 = icmp.eq i64 cmpmode, 0
+    condbr %m0, direct(a, b, cmpptr, priv), chk1(a, b, cmpmode, cmpfp, priv)
+  direct(a: ptr, b: ptr, fp: ptr, priv: ptr):
+    %r = calli i32 kls_cmp_r %fp(a, b, priv)
+    ret %r
+  chk1(a: ptr, b: ptr, cmpmode: i64, cmpfp: ptr, priv: ptr):
+    %m1 = icmp.eq i64 cmpmode, 1
+    condbr %m1, fixed(a, b, cmpfp), wrap(a, b, priv)
+  fixed(a: ptr, b: ptr, fp: ptr):
+    %r = calli i32 kls_cmp %fp(a, b)
+    ret %r
+  wrap(a: ptr, b: ptr, priv: ptr):
+    %fp = load ptr, priv
+    %r = calli i32 kls_cmp %fp(a, b)
+    ret %r
+}
+
+; do_swap: swapmode selects the swap mechanism.
+fn kls_do_swap(ptr, ptr, i64, i64, ptr, ptr, ptr) -> void {
+  entry(a: ptr, b: ptr, size: i64, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %m0 = icmp.eq i64 swapmode, 0
+    condbr %m0, w64(a, b, size), chk1(a, b, size, swapmode, swapptr, swapfp, priv)
+  w64(a: ptr, b: ptr, size: i64):
+    call void kls_swap_words_64(a, b, size)
+    ret
+  chk1(a: ptr, b: ptr, size: i64, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %m1 = icmp.eq i64 swapmode, 1
+    condbr %m1, w32(a, b, size), chk2(a, b, size, swapmode, swapptr, swapfp, priv)
+  w32(a: ptr, b: ptr, size: i64):
+    call void kls_swap_words_32(a, b, size)
+    ret
+  chk2(a: ptr, b: ptr, size: i64, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %m2 = icmp.eq i64 swapmode, 2
+    condbr %m2, byt(a, b, size), chk3(a, b, size, swapmode, swapptr, swapfp, priv)
+  byt(a: ptr, b: ptr, size: i64):
+    call void kls_swap_bytes(a, b, size)
+    ret
+  chk3(a: ptr, b: ptr, size: i64, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %m3 = icmp.eq i64 swapmode, 3
+    condbr %m3, direct(a, b, size, swapptr, priv), chk4(a, b, size, swapmode, swapfp, priv)
+  direct(a: ptr, b: ptr, size: i64, fp: ptr, priv: ptr):
+    %sz = trunc i32 size
+    calli void kls_swap_r %fp(a, b, %sz, priv)
+    ret
+  chk4(a: ptr, b: ptr, size: i64, swapmode: i64, swapfp: ptr, priv: ptr):
+    %m4 = icmp.eq i64 swapmode, 4
+    condbr %m4, fixed(a, b, size, swapfp), wrap(a, b, size, priv)
+  fixed(a: ptr, b: ptr, size: i64, fp: ptr):
+    %sz = trunc i32 size
+    calli void kls_swap %fp(a, b, %sz)
+    ret
+  wrap(a: ptr, b: ptr, size: i64, priv: ptr):
+    %pp = gep i8 priv, 8
+    %fp = load ptr, %pp
+    %sz = trunc i32 size
+    calli void kls_swap %fp(a, b, %sz)
+    ret
+}
+
+fn kls_parent(i64, i64, i64) -> i64 {
+  entry(i0: i64, lsbit: i64, size: i64):
+    %i1 = sub i64 i0, size
+    %t = and i64 %i1, lsbit
+    %neg = sub i64 0, %t
+    %adj = and i64 size, %neg
+    %i2 = sub i64 %i1, %adj
+    %r = udiv i64 %i2, 2
+    ret %r
+}
+
+; The default swap pick: is_aligned(base, size, 8/4) with
+; the base ignored under efficient unaligned access.
+fn kls_pick(i64) -> i64 {
+  entry(size: i64):
+    %s8 = and i64 size, 255
+    %a8 = and i64 %s8, 7
+    %z8 = icmp.eq i64 %a8, 0
+    condbr %z8, m0(), chk4(size, %s8)
+  m0():
+    ret 0
+  chk4(size: i64, s8: i64):
+    %a4 = and i64 s8, 3
+    %z4 = icmp.eq i64 %a4, 0
+    %r = select i64 %z4, 1, 2
+    ret %r
+}
+
+; __sort_r with the mode plumbing described in the header.
+; args: base, num, size, cmpmode, cmpptr, cmpfp,
+;       swapmode, swapptr, swapfp, priv, may_sched
+fn kls_sort_r(ptr, i64, i64, i64, ptr, ptr, i64, ptr, ptr, ptr, i64) -> void {
+  entry(base: ptr, num: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64):
+    %n = mul i64 num, size
+    %half = udiv i64 num, 2
+    %a0 = mul i64 %half, size
+    %neg = sub i64 0, size
+    %lsb64 = and i64 size, %neg
+    %lsb32 = trunc i32 %lsb64
+    %lsbit = zext i64 %lsb32
+    %z = icmp.eq i64 %a0, 0
+    condbr %z, done(), main(base, %n, %a0, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, %lsbit, 0)
+  main(base: ptr, n: i64, a: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %anz = icmp.ne i64 a, 0
+    condbr %anz, build(base, n, a, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift), chk_extract(base, n, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit)
+  build(base: ptr, n: i64, a: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %sh = shl i64 size, shift
+    %a1 = sub i64 a, %sh
+    br sift(base, n, %a1, %a1, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  chk_extract(base: ptr, n: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64):
+    %three = mul i64 size, 3
+    %gt = icmp.ugt i64 n, %three
+    condbr %gt, extract(base, n, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit), finish(base, n, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv)
+  extract(base: ptr, n: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64):
+    %n1 = sub i64 n, size
+    %pn = gep i8 base, %n1
+    call void kls_do_swap(base, %pn, size, swapmode, swapptr, swapfp, priv)
+    %p1 = gep i8 base, size
+    %two = mul i64 size, 2
+    %p2 = gep i8 base, %two
+    %cr = call i32 kls_do_cmp(%p1, %p2, cmpmode, cmpptr, cmpfp, priv)
+    %cz = sext i64 %cr
+    %le = icmp.sle i64 %cz, 0
+    %shift = select i64 %le, 1, 0
+    %a = shl i64 size, %shift
+    %n2 = sub i64 %n1, size
+    %pa = gep i8 base, %a
+    %pn2 = gep i8 base, %n2
+    call void kls_do_swap(%pa, %pn2, size, swapmode, swapptr, swapfp, priv)
+    br sift(base, %n2, %a, %a, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, %shift)
+  ; sift-down path: b walks from a to the leaves.
+  sift(base: ptr, n: i64, a: i64, b: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %c = add i64 b, b
+    %c1 = add i64 %c, size
+    %d = add i64 %c1, size
+    %lt = icmp.ult i64 %d, n
+    condbr %lt, sift_cmp(base, n, a, %c1, %d, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift), sift_done(base, n, a, b, %c1, %d, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  sift_cmp(base: ptr, n: i64, a: i64, c: i64, d: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %pc = gep i8 base, c
+    %pd = gep i8 base, d
+    %cr = call i32 kls_do_cmp(%pc, %pd, cmpmode, cmpptr, cmpfp, priv)
+    %cz = sext i64 %cr
+    %gt = icmp.sgt i64 %cz, 0
+    %b = select i64 %gt, c, d
+    br sift(base, n, a, %b, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  sift_done(base: ptr, n: i64, a: i64, b: i64, c: i64, d: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %eq = icmp.eq i64 d, n
+    %b1 = select i64 %eq, c, b
+    br backtrack(base, n, a, %b1, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  backtrack(base: ptr, n: i64, a: i64, b: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %ne = icmp.ne i64 b, a
+    condbr %ne, bt_cmp(base, n, a, b, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift), place(base, n, a, b, b, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  bt_cmp(base: ptr, n: i64, a: i64, b: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %pa = gep i8 base, a
+    %pb = gep i8 base, b
+    %cr = call i32 kls_do_cmp(%pa, %pb, cmpmode, cmpptr, cmpfp, priv)
+    %cz = sext i64 %cr
+    %ge = icmp.sge i64 %cz, 0
+    condbr %ge, bt_up(base, n, a, b, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift), place(base, n, a, b, b, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  bt_up(base: ptr, n: i64, a: i64, b: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %b1 = call i64 kls_parent(b, lsbit, size)
+    br backtrack(base, n, a, %b1, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  ; shift into place: c is the saved insertion point.
+  place(base: ptr, n: i64, a: i64, b: i64, c: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %ne = icmp.ne i64 b, a
+    condbr %ne, place_step(base, n, a, b, c, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift), main(base, n, a, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  place_step(base: ptr, n: i64, a: i64, b: i64, c: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr, maysched: i64, lsbit: i64, shift: i64):
+    %b1 = call i64 kls_parent(b, lsbit, size)
+    %pb = gep i8 base, %b1
+    %pc = gep i8 base, c
+    call void kls_do_swap(%pb, %pc, size, swapmode, swapptr, swapfp, priv)
+    br place(base, n, a, %b1, c, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv, maysched, lsbit, shift)
+  finish(base: ptr, n0: i64, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %n = sub i64 n0, size
+    %pn = gep i8 base, %n
+    call void kls_do_swap(base, %pn, size, swapmode, swapptr, swapfp, priv)
+    %two = mul i64 size, 2
+    %eq = icmp.eq i64 %n, %two
+    condbr %eq, fin_cmp(base, size, cmpmode, cmpptr, cmpfp, swapmode, swapptr, swapfp, priv), done()
+  fin_cmp(base: ptr, size: i64, cmpmode: i64, cmpptr: ptr, cmpfp: ptr, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %ps = gep i8 base, size
+    %cr = call i32 kls_do_cmp(base, %ps, cmpmode, cmpptr, cmpfp, priv)
+    %cz = sext i64 %cr
+    %gt = icmp.sgt i64 %cz, 0
+    condbr %gt, fin_swap(base, size, swapmode, swapptr, swapfp, priv), done()
+  fin_swap(base: ptr, size: i64, swapmode: i64, swapptr: ptr, swapfp: ptr, priv: ptr):
+    %ps = gep i8 base, size
+    call void kls_do_swap(base, %ps, size, swapmode, swapptr, swapfp, priv)
+    br done()
+  done():
+    ret
+}
+
+; sort_r entry: resolve the cmp/swap sentinels.
+fn kls_sort_r_entry(ptr, i64, i64, ptr, ptr, ptr, i64) -> void {
+  entry(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr, priv: ptr, maysched: i64):
+    %cmpv = call i64 kls_ptrval(cmp)
+    %cm2 = icmp.eq i64 %cmpv, 0
+    %cmpmode2 = select i64 %cm2, 2, 0
+    %swapv = call i64 kls_ptrval(swap)
+    br swap_dispatch(base, num, size, %cmpmode2, cmp, swap, %swapv, priv, maysched)
+  swap_dispatch(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, swap: ptr, swapv: i64, priv: ptr, maysched: i64):
+    %z = icmp.eq i64 swapv, 0
+    condbr %z, pick(base, num, size, cmpmode, cmp, priv, maysched), chk1(base, num, size, cmpmode, cmp, swap, swapv, priv, maysched)
+  pick(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, priv: ptr, maysched: i64):
+    %mode = call i64 kls_pick(size)
+    call void kls_sort_r(base, num, size, cmpmode, cmp, cmp, %mode, swap, swap, priv, maysched)
+    ret
+  chk1(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, swap: ptr, swapv: i64, priv: ptr, maysched: i64):
+    %o = icmp.eq i64 swapv, 1
+    condbr %o, use(base, num, size, cmpmode, cmp, swap, 1, priv, maysched), chk2(base, num, size, cmpmode, cmp, swap, swapv, priv, maysched)
+  chk2(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, swap: ptr, swapv: i64, priv: ptr, maysched: i64):
+    %t = icmp.eq i64 swapv, 2
+    condbr %t, use(base, num, size, cmpmode, cmp, swap, 2, priv, maysched), chk3(base, num, size, cmpmode, cmp, swap, swapv, priv, maysched)
+  chk3(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, swap: ptr, swapv: i64, priv: ptr, maysched: i64):
+    %th = icmp.eq i64 swapv, 3
+    condbr %th, wrapchk(base, num, size, cmpmode, cmp, priv, maysched), use(base, num, size, cmpmode, cmp, swap, 3, priv, maysched)
+  wrapchk(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, priv: ptr, maysched: i64):
+    %pp = gep i8 priv, 8
+    %fp = load ptr, %pp
+    %fv = call i64 kls_ptrval(%fp)
+    %z = icmp.eq i64 %fv, 0
+    condbr %z, pick(base, num, size, cmpmode, cmp, priv, maysched), wrapuse(base, num, size, cmpmode, cmp, priv, maysched)
+  wrapuse(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, priv: ptr, maysched: i64):
+    call void kls_sort_r(base, num, size, cmpmode, cmp, cmp, 5, cmp, cmp, priv, maysched)
+    ret
+  use(base: ptr, num: i64, size: i64, cmpmode: i64, cmp: ptr, swap: ptr, mode: i64, priv: ptr, maysched: i64):
+    call void kls_sort_r(base, num, size, cmpmode, cmp, cmp, mode, swap, swap, priv, maysched)
+    ret
+}
+
+fn sort_r(ptr, i64, i64, ptr, ptr, ptr) -> void {
+  entry(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr, priv: ptr):
+    call void kls_sort_r_entry(base, num, size, cmp, swap, priv, 0)
+    ret
+}
+
+fn sort_r_nonatomic(ptr, i64, i64, ptr, ptr, ptr) -> void {
+  entry(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr, priv: ptr):
+    call void kls_sort_r_entry(base, num, size, cmp, swap, priv, 1)
+    ret
+}
+
+fn kls_sort_entry(ptr, i64, i64, ptr, ptr, i64) -> void {
+  entry(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr, maysched: i64):
+    %sv = call i64 kls_ptrval(swap)
+    %z = icmp.eq i64 %sv, 0
+    condbr %z, pick(base, num, size, cmp, maysched), use(base, num, size, cmp, swap, maysched)
+  pick(base: ptr, num: i64, size: i64, cmp: ptr, maysched: i64):
+    %mode = call i64 kls_pick(size)
+    call void kls_sort_r(base, num, size, 1, cmp, cmp, %mode, cmp, cmp, cmp, maysched)
+    ret
+  use(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr, maysched: i64):
+    call void kls_sort_r(base, num, size, 1, cmp, cmp, 4, swap, swap, cmp, maysched)
+    ret
+}
+
+fn sort(ptr, i64, i64, ptr, ptr) -> void {
+  entry(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr):
+    call void kls_sort_entry(base, num, size, cmp, swap, 0)
+    ret
+}
+
+fn sort_nonatomic(ptr, i64, i64, ptr, ptr) -> void {
+  entry(base: ptr, num: i64, size: i64, cmp: ptr, swap: ptr):
+    call void kls_sort_entry(base, num, size, cmp, swap, 1)
+    ret
+}

@@ -1,0 +1,401 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; lib/cmdline.c, rewritten in Krell for the Krellinux conversion.
+;
+; get_option, get_options, memparse, parse_option_str, next_arg,
+; plus the file-local get_range as kls_get_range.
+;
+; Conversion notes:
+;   * simple_strtoull / simple_strtol (lib/vsprintf.c),
+;     skip_spaces (lib/string_helpers.c), and strlen / strncmp
+;     (lib/string.c) are external calls to the C functions, as in
+;     the C file.  strncmp is declared with its C int return so
+;     the comparison reads eax exactly as the C caller does.
+;   * check_sub_overflow in get_range is mirrored in widened
+;     arithmetic: the difference is computed in i64, and on
+;     overflow the C file's sign rule applies (upper < *pint
+;     gives -1, otherwise INT_MAX).
+;   * check_shl_overflow in memparse is a shift-and-shift-back
+;     test.  The suffix cascade (E falls through P, T, G, M to K,
+;     each adding 10) is the shift ladder 60/50/40/30/20/10.
+;   * isspace in next_arg is the kernel _ctype _S set on the
+;     unsigned char value: {9, 10, 11, 12, 13, 32, 160}.
+;   * NULL pointers (get_range's endptr argument, next_arg's
+;     *val) are materialized by kcmd_null, type-punning 0
+;     through an alloca slot; pointer equality tests pun the
+;     pointers the same way (Krell has no null constant and no
+;     pointer comparisons).
+;   * int arguments (nints, get_range's n) are truncated to 32
+;     bits on entry, the width the C ABI guarantees.
+extern simple_strtoull(ptr, ptr, i64) -> i64
+extern simple_strtol(ptr, ptr, i64) -> i64
+extern skip_spaces(ptr) -> ptr
+extern strlen(ptr) -> i64
+extern strncmp(ptr, ptr, i64) -> i32
+
+fn kcmd_null() -> ptr {
+  entry():
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    %p = load ptr, %slot
+    ret %p
+}
+
+fn kls_get_range(ptr, ptr, i64) -> i64 {
+  entry(str_pp: ptr, pint: ptr, n_in: i64):
+    %sp = load ptr, str_pp
+    %sp1 = gep i8 %sp, 1
+    store ptr str_pp, %sp1
+    %np = call ptr kcmd_null()
+    %str2 = load ptr, str_pp
+    %uv = call i64 simple_strtol(%str2, %np, 0)
+    %u32 = trunc i32 %uv
+    %upper = sext i64 %u32
+    %pv32 = load i32, pint
+    %pv = sext i64 %pv32
+    %diff = sub i64 %upper, %pv
+    %o1 = icmp.sgt i64 %diff, 2147483647
+    %o2 = icmp.slt i64 %diff, -2147483648
+    %ovf = or i1 %o1, %o2
+    %lt = icmp.slt i64 %upper, %pv
+    %oinc = select i64 %lt, -1, 2147483647
+    %inc = select i64 %ovf, %oinc, %diff
+    %n32 = trunc i32 n_in
+    %n = sext i64 %n32
+    br loop(pint, %pv, %upper, %n, 0, %inc)
+  loop(pint: ptr, x: i64, upper: i64, n: i64, idx: i64, inc: i64):
+    %hn = icmp.sgt i64 n, 0
+    %hx = icmp.slt i64 x, upper
+    %go = and i1 %hn, %hx
+    condbr %go, body(pint, x, upper, n, idx, inc), done(inc)
+  body(pint: ptr, x: i64, upper: i64, n: i64, idx: i64, inc: i64):
+    %off = mul i64 idx, 4
+    %dst = gep i8 pint, %off
+    %xv = trunc i32 x
+    store i32 %dst, %xv
+    %nx = add i64 x, 1
+    %nn = sub i64 n, 1
+    %ni = add i64 idx, 1
+    br loop(pint, %nx, upper, %nn, %ni, inc)
+  done(inc: i64):
+    ret inc
+}
+
+fn get_option(ptr, ptr) -> i64 {
+  entry(str_pp: ptr, pint: ptr):
+    %cur = load ptr, str_pp
+    %slot = alloca 8, 8
+    store ptr %slot, %cur
+    %ci = load i64, %slot
+    %isnull = icmp.eq i64 %ci, 0
+    condbr %isnull, zero(), go(str_pp, pint, %cur)
+  zero():
+    ret 0
+  go(str_pp: ptr, pint: ptr, cur: ptr):
+    %c = load i8, cur
+    %empty = icmp.eq i8 %c, 0
+    condbr %empty, zero(), sign(str_pp, pint, cur, %c)
+  sign(str_pp: ptr, pint: ptr, cur: ptr, c: i8):
+    %minus = icmp.eq i8 c, 45
+    condbr %minus, neg(str_pp, pint, cur), pos(str_pp, pint, cur)
+  neg(str_pp: ptr, pint: ptr, cur: ptr):
+    %cur1 = gep i8 cur, 1
+    %v = call i64 simple_strtoull(%cur1, str_pp, 0)
+    %nv = sub i64 0, %v
+    %val = trunc i32 %nv
+    br have(str_pp, pint, %cur1, %val)
+  pos(str_pp: ptr, pint: ptr, cur: ptr):
+    %v = call i64 simple_strtoull(cur, str_pp, 0)
+    %val = trunc i32 %v
+    br have(str_pp, pint, cur, %val)
+  have(str_pp: ptr, pint: ptr, cur: ptr, val: i32):
+    %slot = alloca 8, 8
+    store ptr %slot, pint
+    %pi = load i64, %slot
+    %pnull = icmp.eq i64 %pi, 0
+    condbr %pnull, adv(str_pp, cur), setp(str_pp, pint, cur, val)
+  setp(str_pp: ptr, pint: ptr, cur: ptr, val: i32):
+    store i32 pint, val
+    br adv(str_pp, cur)
+  adv(str_pp: ptr, cur: ptr):
+    %now = load ptr, str_pp
+    %slot = alloca 8, 8
+    store ptr %slot, %now
+    %ni = load i64, %slot
+    store ptr %slot, cur
+    %ci = load i64, %slot
+    %same = icmp.eq i64 %ni, %ci
+    condbr %same, zero(), tail(str_pp, %now)
+  tail(str_pp: ptr, now: ptr):
+    %c = load i8, now
+    %comma = icmp.eq i8 %c, 44
+    condbr %comma, comma(str_pp, now), notch(str_pp, now, %c)
+  comma(str_pp: ptr, now: ptr):
+    %n1 = gep i8 now, 1
+    store ptr str_pp, %n1
+    ret 2
+  notch(str_pp: ptr, now: ptr, c: i8):
+    %hyph = icmp.eq i8 c, 45
+    %r = select i64 %hyph, 3, 1
+    ret %r
+}
+
+fn get_options(ptr, i64, ptr) -> ptr {
+  entry(str0: ptr, nints_in: i64, ints: ptr):
+    %n32 = trunc i32 nints_in
+    %nints = sext i64 %n32
+    %validate = icmp.eq i64 %nints, 0
+    br loop(str0, %nints, ints, %validate, 1)
+  loop(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64):
+    %lt = icmp.slt i64 i, nints
+    %go = or i1 %lt, validate
+    condbr %go, step(str, nints, ints, validate, i), fin(ints, i, str)
+  step(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64):
+    %off = mul i64 i, 4
+    %pi = gep i8 ints, %off
+    %pint = select ptr validate, ints, %pi
+    %slot = alloca 8, 8
+    store ptr %slot, str
+    %res = call i64 get_option(%slot, %pint)
+    %str2 = load ptr, %slot
+    %z = icmp.eq i64 %res, 0
+    condbr %z, fin(ints, i, %str2), rchk(%str2, nints, ints, validate, i, %res, %pint, %slot)
+  rchk(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64, res: i64, pint: ptr, slot: ptr):
+    %three = icmp.eq i64 res, 3
+    condbr %three, range(str, nints, ints, validate, i, pint, slot), post(str, nints, ints, validate, i, res)
+  range(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64, pint: ptr, slot: ptr):
+    %rem = sub i64 nints, i
+    %n = select i64 validate, 0, %rem
+    %rn = call i64 kls_get_range(slot, pint, %n)
+    %str2 = load ptr, slot
+    %neg = icmp.slt i64 %rn, 0
+    condbr %neg, fin(ints, i, %str2), rfit(%str2, nints, ints, validate, i, %rn, %n)
+  rfit(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64, rn: i64, n: i64):
+    %big = icmp.sgt i64 rn, n
+    %nv = icmp.eq i1 validate, 0
+    %full2 = and i1 %big, %nv
+    condbr %full2, full(ints, nints, str), rroom(str, nints, ints, validate, i, rn)
+  full(ints: ptr, nints: i64, str: ptr):
+    br fin(ints, nints, str)
+  rroom(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64, rn: i64):
+    %room = sub i64 2147483647, i
+    %toobig = icmp.sge i64 rn, %room
+    condbr %toobig, fin(ints, i, str), radj(str, nints, ints, validate, i, rn)
+  radj(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64, rn: i64):
+    %d = sub i64 rn, 1
+    %i2 = add i64 i, %d
+    br post(str, nints, ints, validate, %i2, 3)
+  post(str: ptr, nints: i64, ints: ptr, validate: i1, i: i64, res: i64):
+    %i2 = add i64 i, 1
+    %one = icmp.eq i64 res, 1
+    condbr %one, fin(ints, %i2, str), loop(str, nints, ints, validate, %i2)
+  fin(ints: ptr, i: i64, str: ptr):
+    %cnt = sub i64 i, 1
+    %c32 = trunc i32 %cnt
+    store i32 ints, %c32
+    ret str
+}
+
+fn memparse(ptr, ptr) -> i64 {
+  entry(ptr0: ptr, retptr: ptr):
+    %slot = alloca 8, 8
+    %ret = call i64 simple_strtoull(ptr0, %slot, 0)
+    %end = load ptr, %slot
+    %c = load i8, %end
+    %e1 = icmp.eq i8 %c, 69
+    %e2 = icmp.eq i8 %c, 101
+    %isE = or i1 %e1, %e2
+    %p1 = icmp.eq i8 %c, 80
+    %p2 = icmp.eq i8 %c, 112
+    %isP = or i1 %p1, %p2
+    %t1 = icmp.eq i8 %c, 84
+    %t2 = icmp.eq i8 %c, 116
+    %isT = or i1 %t1, %t2
+    %g1 = icmp.eq i8 %c, 71
+    %g2 = icmp.eq i8 %c, 103
+    %isG = or i1 %g1, %g2
+    %m1 = icmp.eq i8 %c, 77
+    %m2 = icmp.eq i8 %c, 109
+    %isM = or i1 %m1, %m2
+    %k1 = icmp.eq i8 %c, 75
+    %k2 = icmp.eq i8 %c, 107
+    %isK = or i1 %k1, %k2
+    %sE = select i64 %isE, 60, 0
+    %sP = select i64 %isP, 50, %sE
+    %sT = select i64 %isT, 40, %sP
+    %sG = select i64 %isG, 30, %sT
+    %sM = select i64 %isM, 20, %sG
+    %shl = select i64 %isK, 10, %sM
+    %nz = icmp.ne i64 %shl, 0
+    %slot2 = alloca 8, 8
+    store ptr %slot2, ptr0
+    %ai = load i64, %slot2
+    store ptr %slot2, %end
+    %bi = load i64, %slot2
+    %diff = icmp.ne i64 %ai, %bi
+    %apply = and i1 %nz, %diff
+    condbr %apply, shift(ptr0, retptr, %end, %ret, %shl), tail(retptr, %end, %ret)
+  shift(ptr0: ptr, retptr: ptr, end: ptr, ret: i64, shl: i64):
+    %sh = shl i64 ret, shl
+    %back = lshr i64 %sh, shl
+    %ovf = icmp.ne i64 %back, ret
+    %m1 = sub i64 0, 1
+    %nr = select i64 %ovf, %m1, %sh
+    %end2 = gep i8 end, 1
+    br tail(retptr, %end2, %nr)
+  tail(retptr: ptr, end: ptr, ret: i64):
+    %slot = alloca 8, 8
+    store ptr %slot, retptr
+    %ri = load i64, %slot
+    %isnull = icmp.eq i64 %ri, 0
+    condbr %isnull, done(ret), setp(retptr, end, ret)
+  setp(retptr: ptr, end: ptr, ret: i64):
+    store ptr retptr, end
+    br done(ret)
+  done(ret: i64):
+    ret ret
+}
+
+fn parse_option_str(ptr, ptr) -> i64 {
+  entry(str0: ptr, option: ptr):
+    %olen = call i64 strlen(option)
+    br loop(str0, option, %olen)
+  loop(str: ptr, option: ptr, olen: i64):
+    %c = load i8, str
+    %nz = icmp.ne i8 %c, 0
+    condbr %nz, step(str, option, olen), no()
+  no():
+    ret 0
+  yes():
+    ret 1
+  step(str: ptr, option: ptr, olen: i64):
+    %r32 = call i32 strncmp(str, option, olen)
+    %r = sext i64 %r32
+    %hit = icmp.eq i64 %r, 0
+    condbr %hit, match(str, olen), seek(str, option, olen)
+  match(str: ptr, olen: i64):
+    %s2 = gep i8 str, olen
+    %c = load i8, %s2
+    %end = icmp.eq i8 %c, 0
+    %comma = icmp.eq i8 %c, 44
+    %ok = or i1 %end, %comma
+    condbr %ok, yes(), seek(str, option, olen)
+  seek(str: ptr, option: ptr, olen: i64):
+    br seekloop(str, option, olen)
+  seekloop(str: ptr, option: ptr, olen: i64):
+    %c = load i8, str
+    %nz = icmp.ne i8 %c, 0
+    %nc = icmp.ne i8 %c, 44
+    %go = and i1 %nz, %nc
+    condbr %go, adv(str, option, olen), atsep(str, option, olen, %c)
+  adv(str: ptr, option: ptr, olen: i64):
+    %s2 = gep i8 str, 1
+    br seekloop(%s2, option, olen)
+  atsep(str: ptr, option: ptr, olen: i64, c: i8):
+    %comma = icmp.eq i8 c, 44
+    %s2 = gep i8 str, 1
+    %next = select ptr %comma, %s2, str
+    br loop(%next, option, olen)
+}
+
+fn next_arg(ptr, ptr, ptr) -> ptr {
+  entry(args0: ptr, param: ptr, val: ptr):
+    %c = load i8, args0
+    %q = icmp.eq i8 %c, 34
+    %a1 = gep i8 args0, 1
+    %args = select ptr %q, %a1, args0
+    %inq = select i64 %q, 1, 0
+    br scan(%args, param, val, 0, 0, %inq, %q)
+  scan(args: ptr, param: ptr, val: ptr, i: i64, equals: i64, inq: i64, quoted: i1):
+    %p = gep i8 args, i
+    %c8 = load i8, %p
+    %nz = icmp.ne i8 %c8, 0
+    condbr %nz, ch(args, param, val, i, equals, inq, quoted, %c8), fin(args, param, val, i, equals, quoted)
+  ch(args: ptr, param: ptr, val: ptr, i: i64, equals: i64, inq: i64, quoted: i1, c8: i8):
+    %cu = zext i64 c8
+    %s1 = icmp.eq i64 %cu, 9
+    %s2 = icmp.eq i64 %cu, 10
+    %s3 = icmp.eq i64 %cu, 11
+    %s4 = icmp.eq i64 %cu, 12
+    %s5 = icmp.eq i64 %cu, 13
+    %s6 = icmp.eq i64 %cu, 32
+    %s7 = icmp.eq i64 %cu, 160
+    %sa = or i1 %s1, %s2
+    %sb = or i1 %s3, %s4
+    %sc = or i1 %s5, %s6
+    %sd = or i1 %sa, %sb
+    %se = or i1 %sc, %s7
+    %issp = or i1 %sd, %se
+    %inqz = icmp.eq i64 inq, 0
+    %brk = and i1 %issp, %inqz
+    condbr %brk, fin(args, param, val, i, equals, quoted), upd(args, param, val, i, equals, inq, quoted, c8)
+  upd(args: ptr, param: ptr, val: ptr, i: i64, equals: i64, inq: i64, quoted: i1, c8: i8):
+    %ise = icmp.eq i8 c8, 61
+    %ez = icmp.eq i64 equals, 0
+    %set = and i1 %ise, %ez
+    %neq = select i64 %set, i, equals
+    %isq = icmp.eq i8 c8, 34
+    %flip = sub i64 1, inq
+    %ninq = select i64 %isq, %flip, inq
+    %ni = add i64 i, 1
+    br scan(args, param, val, %ni, %neq, %ninq, quoted)
+  fin(args: ptr, param: ptr, val: ptr, i: i64, equals: i64, quoted: i1):
+    store ptr param, args
+    %ez = icmp.eq i64 equals, 0
+    condbr %ez, noval(args, val, i, quoted), witheq(args, val, i, equals, quoted)
+  noval(args: ptr, val: ptr, i: i64, quoted: i1):
+    %np = call ptr kcmd_null()
+    store ptr val, %np
+    br close(args, i, quoted)
+  witheq(args: ptr, val: ptr, i: i64, equals: i64, quoted: i1):
+    %ep = gep i8 args, equals
+    store i8 %ep, 0
+    %vp = gep i8 args, equals
+    %vpp = gep i8 %vp, 1
+    store ptr val, %vpp
+    %vc = load i8, %vpp
+    %isq = icmp.eq i8 %vc, 34
+    condbr %isq, vq(args, val, i, quoted, %vpp), close(args, i, quoted)
+  vq(args: ptr, val: ptr, i: i64, quoted: i1, vpp: ptr):
+    %v2 = gep i8 vpp, 1
+    store ptr val, %v2
+    %im = sub i64 i, 1
+    %lp = gep i8 args, %im
+    %lc = load i8, %lp
+    %isq = icmp.eq i8 %lc, 34
+    condbr %isq, vq2(args, %lp, i, quoted), close(args, i, quoted)
+  vq2(args: ptr, lp: ptr, i: i64, quoted: i1):
+    store i8 lp, 0
+    br close(args, i, quoted)
+  close(args: ptr, i: i64, quoted: i1):
+    %need = icmp.eq i1 quoted, 1
+    condbr %need, qchk(args, i), tail(args, i)
+  qchk(args: ptr, i: i64):
+    %pos = icmp.sgt i64 i, 0
+    condbr %pos, qchk2(args, i), tail(args, i)
+  qchk2(args: ptr, i: i64):
+    %im = sub i64 i, 1
+    %lp = gep i8 args, %im
+    %lc = load i8, %lp
+    %isq = icmp.eq i8 %lc, 34
+    condbr %isq, qset(args, i, %lp), tail(args, i)
+  qset(args: ptr, i: i64, lp: ptr):
+    store i8 lp, 0
+    br tail(args, i)
+  tail(args: ptr, i: i64):
+    %p = gep i8 args, i
+    %c = load i8, %p
+    %nz = icmp.ne i8 %c, 0
+    condbr %nz, tsep(args, i), tend(args, i)
+  tsep(args: ptr, i: i64):
+    %p = gep i8 args, i
+    store i8 %p, 0
+    %n = add i64 i, 1
+    %na = gep i8 args, %n
+    br retsp(%na)
+  tend(args: ptr, i: i64):
+    %na = gep i8 args, i
+    br retsp(%na)
+  retsp(na: ptr):
+    %r = call ptr skip_spaces(na)
+    ret %r
+}

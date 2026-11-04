@@ -50,6 +50,47 @@ OVERRIDES = {
         "plus random full-range values), 0 divergence; Krell object "
         "linked into vmlinux and self-checked at boot (Phase 1 batch 1). "
         "The C file still provides the symbols."),
+    "lib/kstrtox.c": (
+        "KRELL (functions)",
+        "17 of 28 functions rewritten in Krell (lib/kstrtox.krell): "
+        "_parse_integer_fixup_radix, _parse_integer_limit, the "
+        "kstrtoull/kstrtoll family and its width wrappers, "
+        "kstrtobool, and the kstrtoudec64/kstrtodec64 scaled "
+        "decimals; differential rig vs the C original: part of the "
+        "batch 4 rig (215,447 cases across the batch, 0 divergence); "
+        "Krell objects linked into vmlinux and self-checked at boot "
+        "(Phase 1 batch 4). Residue: the 11 *_from_user wrappers "
+        "stay C -- they stage the user string in a stack buffer of "
+        "11 to 67 bytes, and the current Krell native backend "
+        "addresses an alloca region from its top, so writes past "
+        "the first 8 bytes of a buffer overwrite the frame (batch 4 "
+        "record has the reproducer); the wrappers convert when a "
+        "compiler with the alloca fix is pinned. The C file still "
+        "provides the symbols."),
+    "lib/cmdline.c": (
+        "KRELL (functions)",
+        "get_option, get_options, memparse, parse_option_str and "
+        "next_arg rewritten in Krell (lib/cmdline.krell), with the "
+        "file-local get_range as an internal helper; differential "
+        "rig vs the C original: part of the batch 4 rig (215,447 "
+        "cases across the batch, 0 divergence); Krell objects "
+        "linked into vmlinux and self-checked at boot (Phase 1 "
+        "batch 4). simple_strtoull/simple_strtol, skip_spaces and "
+        "strlen/strncmp are called externally, as in C. The C file "
+        "still provides the symbols."),
+    "lib/bsearch.c": (
+        "KRELL (function)",
+        "bsearch() rewritten in Krell (lib/bsearch.krell): the C "
+        "file is a wrapper over __inline_bsearch() from "
+        "include/linux/bsearch.h, and the Krell form is that "
+        "algorithm, with the comparator reached through an "
+        "indirect call on its C signature (ptr, ptr) -> int; "
+        "differential rig vs the header algorithm: part of the "
+        "batch 4 rig (215,447 cases across the batch, 0 "
+        "divergence), including a comparator with poisoned upper "
+        "return bits; Krell object linked into vmlinux and "
+        "self-checked at boot (Phase 1 batch 4). The C file still "
+        "provides the symbol."),
     "lib/string.c": (
         "KRELL (functions)",
         "33 of 34 functions rewritten in Krell (lib/string.krell): "
@@ -117,6 +158,39 @@ EXTRA_ROWS = [
      "full 256-byte table comparisons for ten polynomials, 0 "
      "divergence; Krell object linked into vmlinux and self-checked "
      "at boot (Phase 1 batch 2)."),
+    ("lib/math/gcd.c", "KRELL (function)", "-",
+     "gcd() rewritten in Krell (lib/math/gcd.krell), following "
+     "the binary GCD the C file selects on its static key (the "
+     "fallback loop computes the same gcd; the choice is "
+     "result-invariant); differential rig vs the C original: "
+     "part of the batch 4 rig (215,447 cases across the batch, "
+     "0 divergence); Krell object linked into vmlinux and "
+     "self-checked at boot (Phase 1 batch 4). The C file still "
+     "provides the symbol."),
+    ("lib/math/lcm.c", "KRELL (functions)", "-",
+     "lcm() and lcm_not_zero() rewritten in Krell "
+     "(lib/math/lcm.krell), calling the Krell gcd; differential "
+     "rig vs the C originals: part of the batch 4 rig (215,447 "
+     "cases across the batch, 0 divergence); Krell objects "
+     "linked into vmlinux and self-checked at boot (Phase 1 "
+     "batch 4). The C file still provides the symbols."),
+    ("lib/math/int_pow.c", "KRELL (function)", "-",
+     "int_pow() rewritten in Krell (lib/math/int_pow.krell); "
+     "differential rig vs the C original: part of the batch 4 "
+     "rig (215,447 cases across the batch, 0 divergence); "
+     "Krell object linked into vmlinux and self-checked at "
+     "boot (Phase 1 batch 4). The C file still provides the "
+     "symbol."),
+    ("lib/math/int_sqrt.c", "KRELL (function)", "-",
+     "int_sqrt() rewritten in Krell (lib/math/int_sqrt.krell), "
+     "the C file's shift-and-subtract algorithm operation for "
+     "operation; differential rig vs the C original: part of "
+     "the batch 4 rig (215,447 cases across the batch, 0 "
+     "divergence), including the full 0..100000 range; Krell "
+     "object linked into vmlinux and self-checked at boot "
+     "(Phase 1 batch 4). int_sqrt64() is compiled only when "
+     "BITS_PER_LONG < 64 and has no x86_64 instance. The C "
+     "file still provides the symbol."),
 ]
 
 def main():

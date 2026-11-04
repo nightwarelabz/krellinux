@@ -1,0 +1,602 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/kstrtox.c, rewritten in Krell for the Krellinux conversion.
+;
+; The string-to-integer family: _parse_integer_fixup_radix and
+; _parse_integer_limit (the workhorse, with the header's
+; _parse_integer forms folded into calls with max_chars=INT_MAX
+; and init=0), the kstrto* wrappers, kstrtobool, the scaled
+; decimal pair, and the *_from_user wrappers.
+;
+; Conversion notes:
+;   * _tolower(c) in this file is the ctype.h fast form, c | 0x20,
+;     applied to the char value; it is mirrored byte-wise.
+;   * check_mul_overflow / check_add_overflow are mirrored with
+;     wrapping arithmetic plus a divide-back test for the multiply
+;     (res != 0 and (res * base) / res != base) and a wrap test
+;     for the add (sum < product, unsigned).  They run only on
+;     the same path as in C: when res has bits at or above 2^60.
+;   * Error returns are -ERANGE (-34), -EINVAL (-22), -EFAULT
+;     (-14) as i64 values whose low 32 bits are the C int.
+;   * unsigned int arguments (base, scale) are truncated to 32
+;     bits on entry, the width the C ABI guarantees.
+;   * kstrtoul_from_user / kstrtol_from_user call _kstrtoul /
+;     _kstrtol: in C they name kstrtoul / kstrtol, which are
+;     header inlines over exactly those functions.
+;   * kls_kstrtoull and kls_kstrtoudec64 are the C file's static
+;     helpers (_kstrtoull, _kstrtoudec64).
+;   * int_pow is the Krell int_pow from int_pow.krell (external
+;     here; the build renames it to krell_int_pow).
+;
+; Residue: the 11 *_from_user wrappers stay C.  They stage the
+; user string in a stack buffer of 11 to 67 bytes, and the
+; current Krell native backend addresses an alloca region from
+; its top: writing past the first 8 bytes of an alloca buffer
+; overwrites the function's own saved registers and frame
+; pointer (reproducer in the batch 4 record).  Every other
+; alloca in this conversion is a slot of at most 8 bytes used
+; at offset 0, the pattern batches 1-3 landed.  The wrappers
+; convert as soon as a compiler with the alloca fix is pinned.
+extern int_pow(i64, i64) -> i64
+
+fn _parse_integer_fixup_radix(ptr, ptr) -> ptr {
+  entry(s: ptr, bp: ptr):
+    %b32 = load i32, bp
+    %base = zext i64 %b32
+    %z = icmp.eq i64 %base, 0
+    condbr %z, fix(s, bp), have(s, %base)
+  fix(s: ptr, bp: ptr):
+    %s0 = load i8, s
+    %is0 = icmp.eq i8 %s0, 48
+    condbr %is0, maybe16(s, bp), setb(s, bp, 10)
+  maybe16(s: ptr, bp: ptr):
+    %p1 = gep i8 s, 1
+    %c1 = load i8, %p1
+    %lc = or i8 %c1, 32
+    %isx = icmp.eq i8 %lc, 120
+    condbr %isx, xd(s, bp), setb(s, bp, 8)
+  xd(s: ptr, bp: ptr):
+    %p2 = gep i8 s, 2
+    %c2 = load i8, %p2
+    %c = sext i64 %c2
+    %d1 = icmp.sge i64 %c, 48
+    %d2 = icmp.sle i64 %c, 57
+    %dig = and i1 %d1, %d2
+    %a1 = icmp.sge i64 %c, 97
+    %a2 = icmp.sle i64 %c, 102
+    %low = and i1 %a1, %a2
+    %a3 = icmp.sge i64 %c, 65
+    %a4 = icmp.sle i64 %c, 70
+    %upp = and i1 %a3, %a4
+    %any = or i1 %dig, %low
+    %isxd = or i1 %any, %upp
+    %nb = select i64 %isxd, 16, 8
+    br setb(s, bp, %nb)
+  setb(s: ptr, bp: ptr, nb: i64):
+    %t = trunc i32 nb
+    store i32 bp, %t
+    br have(s, nb)
+  have(s: ptr, base: i64):
+    %is16 = icmp.eq i64 base, 16
+    condbr %is16, chkx(s), keep(s)
+  chkx(s: ptr):
+    %s0 = load i8, s
+    %is0 = icmp.eq i8 %s0, 48
+    condbr %is0, chkx2(s), keep(s)
+  chkx2(s: ptr):
+    %p1 = gep i8 s, 1
+    %c1 = load i8, %p1
+    %lc = or i8 %c1, 32
+    %isx = icmp.eq i8 %lc, 120
+    condbr %isx, skip(s), keep(s)
+  skip(s: ptr):
+    %r = gep i8 s, 2
+    ret %r
+  keep(s: ptr):
+    ret s
+}
+
+fn _parse_integer_limit(ptr, i64, ptr, i64, i64) -> i64 {
+  entry(s: ptr, base_in: i64, p: ptr, maxc: i64, init: i64):
+    %b32 = trunc i32 base_in
+    %base = zext i64 %b32
+    br loop(s, %base, p, maxc, 0, init, 0)
+  loop(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64):
+    %done = icmp.sge i64 rv, maxc
+    condbr %done, fin(p, rv, res, ovf), step(s, base, p, maxc, rv, res, ovf)
+  step(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64):
+    %sp = gep i8 s, rv
+    %c8 = load i8, %sp
+    %c = sext i64 %c8
+    %d1 = icmp.sge i64 %c, 48
+    %d2 = icmp.sle i64 %c, 57
+    %isd = and i1 %d1, %d2
+    %dv = sub i64 %c, 48
+    condbr %isd, use(s, base, p, maxc, rv, res, ovf, %dv), alpha(s, base, p, maxc, rv, res, ovf, %c8)
+  alpha(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64, c8: i8):
+    %lc8 = or i8 c8, 32
+    %lc = sext i64 %lc8
+    %a1 = icmp.sge i64 %lc, 97
+    %a2 = icmp.sle i64 %lc, 102
+    %isa = and i1 %a1, %a2
+    %av = sub i64 %lc, 87
+    condbr %isa, use(s, base, p, maxc, rv, res, ovf, %av), fin(p, rv, res, ovf)
+  use(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64, val: i64):
+    %big = icmp.sge i64 val, base
+    condbr %big, fin(p, rv, res, ovf), acc(s, base, p, maxc, rv, res, ovf, val)
+  acc(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64, val: i64):
+    %hi = lshr i64 res, 60
+    %chk = icmp.ne i64 %hi, 0
+    condbr %chk, checked(s, base, p, maxc, rv, res, ovf, val), plain(s, base, p, maxc, rv, res, ovf, val)
+  plain(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64, val: i64):
+    %t = mul i64 res, base
+    %nr = add i64 %t, val
+    %nrv = add i64 rv, 1
+    br loop(s, base, p, maxc, %nrv, %nr, ovf)
+  checked(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64, val: i64):
+    %prod = mul i64 res, base
+    %rnz = icmp.ne i64 res, 0
+    condbr %rnz, cdiv(s, base, p, maxc, rv, res, ovf, val, %prod), cadd(s, base, p, maxc, rv, ovf, val, %prod)
+  cdiv(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, res: i64, ovf: i64, val: i64, prod: i64):
+    %back = udiv i64 prod, res
+    %movf = icmp.ne i64 %back, base
+    condbr %movf, overf(s, base, p, maxc, rv), cadd(s, base, p, maxc, rv, ovf, val, prod)
+  cadd(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, ovf: i64, val: i64, prod: i64):
+    %sum = add i64 prod, val
+    %aovf = icmp.ult i64 %sum, prod
+    condbr %aovf, overf(s, base, p, maxc, rv), ok(s, base, p, maxc, rv, ovf, %sum)
+  ok(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64, ovf: i64, nres: i64):
+    %nrv = add i64 rv, 1
+    br loop(s, base, p, maxc, %nrv, nres, ovf)
+  overf(s: ptr, base: i64, p: ptr, maxc: i64, rv: i64):
+    %nrv = add i64 rv, 1
+    %m1 = sub i64 0, 1
+    br loop(s, base, p, maxc, %nrv, %m1, 2147483648)
+  fin(p: ptr, rv: i64, res: i64, ovf: i64):
+    store i64 p, res
+    %r = or i64 rv, ovf
+    ret %r
+}
+
+fn kls_kstrtoull(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %bslot = alloca 4, 4
+    %b32 = trunc i32 base
+    store i32 %bslot, %b32
+    %s2 = call ptr _parse_integer_fixup_radix(s, %bslot)
+    %nb32 = load i32, %bslot
+    %nb = zext i64 %nb32
+    %rslot = alloca 8, 8
+    %rv = call i64 _parse_integer_limit(%s2, %nb, %rslot, 2147483647, 0)
+    %ovf = and i64 %rv, 2147483648
+    %hasovf = icmp.ne i64 %ovf, 0
+    condbr %hasovf, erange(), nchk(%s2, %rv, %rslot, res)
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  einval():
+    %m = sub i64 0, 22
+    ret %m
+  nchk(s2: ptr, rv: i64, rslot: ptr, res: ptr):
+    %z = icmp.eq i64 rv, 0
+    condbr %z, einval(), adv(s2, rv, rslot, res)
+  adv(s2: ptr, rv: i64, rslot: ptr, res: ptr):
+    %sp = gep i8 s2, rv
+    br tail(%sp, rslot, res)
+  tail(sp: ptr, rslot: ptr, res: ptr):
+    %c = load i8, sp
+    %isnl = icmp.eq i8 %c, 10
+    condbr %isnl, nl(sp, rslot, res), fin(sp, rslot, res)
+  nl(sp: ptr, rslot: ptr, res: ptr):
+    %sp2 = gep i8 sp, 1
+    br fin(%sp2, rslot, res)
+  fin(sp: ptr, rslot: ptr, res: ptr):
+    %c = load i8, sp
+    %nz = icmp.ne i8 %c, 0
+    condbr %nz, einval(), ok(rslot, res)
+  ok(rslot: ptr, res: ptr):
+    %v = load i64, rslot
+    store i64 res, %v
+    ret 0
+}
+
+fn kstrtoull(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %c = load i8, s
+    %plus = icmp.eq i8 %c, 43
+    %s2 = gep i8 s, 1
+    %sp = select ptr %plus, %s2, s
+    %r = call i64 kls_kstrtoull(%sp, base, res)
+    ret %r
+}
+
+fn kstrtoll(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %c = load i8, s
+    %minus = icmp.eq i8 %c, 45
+    condbr %minus, neg(s, base, res), pos(s, base, res)
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  retv(v: i64):
+    ret v
+  neg(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %s1 = gep i8 s, 1
+    %rv = call i64 kls_kstrtoull(%s1, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), neg2(%tslot, res)
+  neg2(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %nt = sub i64 0, %tmp
+    %pos = icmp.sgt i64 %nt, 0
+    condbr %pos, erange(), negok(res, %nt)
+  negok(res: ptr, nt: i64):
+    store i64 res, %nt
+    ret 0
+  pos(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoull(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), pos2(%tslot, res)
+  pos2(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %negv = icmp.slt i64 %tmp, 0
+    condbr %negv, erange(), posok(res, %tmp)
+  posok(res: ptr, tmp: i64):
+    store i64 res, tmp
+    ret 0
+}
+
+fn _kstrtoul(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoull(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), ok(%tslot, res)
+  retv(v: i64):
+    ret v
+  ok(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    store i64 res, %tmp
+    ret 0
+}
+
+fn _kstrtol(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoll(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), ok(%tslot, res)
+  retv(v: i64):
+    ret v
+  ok(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    store i64 res, %tmp
+    ret 0
+}
+
+fn kstrtouint(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoull(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), chk(%tslot, res)
+  retv(v: i64):
+    ret v
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  chk(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %t32 = trunc i32 %tmp
+    %back = zext i64 %t32
+    %ne = icmp.ne i64 %tmp, %back
+    condbr %ne, erange(), ok(res, %t32)
+  ok(res: ptr, t32: i32):
+    store i32 res, t32
+    ret 0
+}
+
+fn kstrtoint(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoll(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), chk(%tslot, res)
+  retv(v: i64):
+    ret v
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  chk(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %t32 = trunc i32 %tmp
+    %back = sext i64 %t32
+    %ne = icmp.ne i64 %tmp, %back
+    condbr %ne, erange(), ok(res, %t32)
+  ok(res: ptr, t32: i32):
+    store i32 res, t32
+    ret 0
+}
+
+fn kstrtou16(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoull(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), chk(%tslot, res)
+  retv(v: i64):
+    ret v
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  chk(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %t16 = trunc i16 %tmp
+    %back = zext i64 %t16
+    %ne = icmp.ne i64 %tmp, %back
+    condbr %ne, erange(), ok(res, %t16)
+  ok(res: ptr, t16: i16):
+    store i16 res, t16
+    ret 0
+}
+
+fn kstrtos16(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoll(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), chk(%tslot, res)
+  retv(v: i64):
+    ret v
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  chk(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %t16 = trunc i16 %tmp
+    %back = sext i64 %t16
+    %ne = icmp.ne i64 %tmp, %back
+    condbr %ne, erange(), ok(res, %t16)
+  ok(res: ptr, t16: i16):
+    store i16 res, t16
+    ret 0
+}
+
+fn kstrtou8(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoull(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), chk(%tslot, res)
+  retv(v: i64):
+    ret v
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  chk(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %t8 = trunc i8 %tmp
+    %back = zext i64 %t8
+    %ne = icmp.ne i64 %tmp, %back
+    condbr %ne, erange(), ok(res, %t8)
+  ok(res: ptr, t8: i8):
+    store i8 res, t8
+    ret 0
+}
+
+fn kstrtos8(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, base: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoll(s, base, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), chk(%tslot, res)
+  retv(v: i64):
+    ret v
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  chk(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %t8 = trunc i8 %tmp
+    %back = sext i64 %t8
+    %ne = icmp.ne i64 %tmp, %back
+    condbr %ne, erange(), ok(res, %t8)
+  ok(res: ptr, t8: i8):
+    store i8 res, t8
+    ret 0
+}
+
+fn kstrtobool(ptr, ptr) -> i64 {
+  entry(s: ptr, res: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, s
+    %si = load i64, %slot
+    %isnull = icmp.eq i64 %si, 0
+    condbr %isnull, einval(), go(s, res)
+  einval():
+    %m = sub i64 0, 22
+    ret %m
+  yes(res: ptr):
+    store i8 res, 1
+    ret 0
+  no(res: ptr):
+    store i8 res, 0
+    ret 0
+  go(s: ptr, res: ptr):
+    %c8 = load i8, s
+    %c = sext i64 %c8
+    %t1 = icmp.eq i64 %c, 101
+    %t2 = icmp.eq i64 %c, 69
+    %t3 = icmp.eq i64 %c, 121
+    %t4 = icmp.eq i64 %c, 89
+    %t5 = icmp.eq i64 %c, 116
+    %t6 = icmp.eq i64 %c, 84
+    %t7 = icmp.eq i64 %c, 49
+    %ta = or i1 %t1, %t2
+    %tb = or i1 %t3, %t4
+    %tc = or i1 %t5, %t6
+    %td = or i1 %ta, %tb
+    %te = or i1 %tc, %t7
+    %istrue = or i1 %td, %te
+    condbr %istrue, yes(res), fchk(s, res, %c)
+  fchk(s: ptr, res: ptr, c: i64):
+    %f1 = icmp.eq i64 c, 100
+    %f2 = icmp.eq i64 c, 68
+    %f3 = icmp.eq i64 c, 110
+    %f4 = icmp.eq i64 c, 78
+    %f5 = icmp.eq i64 c, 102
+    %f6 = icmp.eq i64 c, 70
+    %f7 = icmp.eq i64 c, 48
+    %fa = or i1 %f1, %f2
+    %fb = or i1 %f3, %f4
+    %fc = or i1 %f5, %f6
+    %fd = or i1 %fa, %fb
+    %fe = or i1 %fc, %f7
+    %isfalse = or i1 %fd, %fe
+    condbr %isfalse, no(res), ochk(s, res, c)
+  ochk(s: ptr, res: ptr, c: i64):
+    %o1 = icmp.eq i64 c, 111
+    %o2 = icmp.eq i64 c, 79
+    %iso = or i1 %o1, %o2
+    condbr %iso, second(s, res), einval()
+  second(s: ptr, res: ptr):
+    %p1 = gep i8 s, 1
+    %c8 = load i8, %p1
+    %c = sext i64 %c8
+    %n1 = icmp.eq i64 %c, 110
+    %n2 = icmp.eq i64 %c, 78
+    %ison = or i1 %n1, %n2
+    condbr %ison, yes(res), offchk(res, %c)
+  offchk(res: ptr, c: i64):
+    %f1 = icmp.eq i64 c, 102
+    %f2 = icmp.eq i64 c, 70
+    %isoff = or i1 %f1, %f2
+    condbr %isoff, no(res), einval()
+}
+
+fn kls_kstrtoudec64(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, scale_in: i64, res: ptr):
+    %sc32 = trunc i32 scale_in
+    %scale = zext i64 %sc32
+    %rslot = alloca 8, 8
+    store i64 %rslot, 0
+    %rvi = call i64 _parse_integer_limit(s, 10, %rslot, 2147483647, 0)
+    %ovf = and i64 %rvi, 2147483648
+    %has = icmp.ne i64 %ovf, 0
+    condbr %has, erange(), iok(s, %scale, res, %rslot, %rvi)
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  einval():
+    %m = sub i64 0, 22
+    ret %m
+  iok(s: ptr, scale: i64, res: ptr, rslot: ptr, rvi: i64):
+    %sp = gep i8 s, rvi
+    %c = load i8, %sp
+    %isdot = icmp.eq i8 %c, 46
+    %sp2 = gep i8 %sp, 1
+    %spn = select ptr %isdot, %sp2, %sp
+    %cur = load i64, rslot
+    %rvf = call i64 _parse_integer_limit(%spn, 10, rslot, scale, %cur)
+    %ovf2 = and i64 %rvf, 2147483648
+    %has2 = icmp.ne i64 %ovf2, 0
+    condbr %has2, erange(), fok(%spn, %rvf, scale, res, rslot, rvi)
+  fok(spn: ptr, rvf: i64, scale: i64, res: ptr, rslot: ptr, rvi: i64):
+    %sp = gep i8 spn, rvf
+    %c8 = load i8, %sp
+    %c = sext i64 %c8
+    %d1 = icmp.sge i64 %c, 48
+    %d2 = icmp.sle i64 %c, 57
+    %isd = and i1 %d1, %d2
+    %zi = icmp.eq i64 rvi, 0
+    %zf = icmp.eq i64 rvf, 0
+    %both = and i1 %zi, %zf
+    %nd = icmp.eq i1 %isd, 0
+    %bad = and i1 %both, %nd
+    condbr %bad, einval(), digloop(%sp, scale, rvf, res, rslot)
+  digloop(sp: ptr, scale: i64, rvf: i64, res: ptr, rslot: ptr):
+    %c8 = load i8, sp
+    %c = sext i64 %c8
+    %d1 = icmp.sge i64 %c, 48
+    %d2 = icmp.sle i64 %c, 57
+    %isd = and i1 %d1, %d2
+    condbr %isd, adv(sp, scale, rvf, res, rslot), after(sp, scale, rvf, res, rslot, %c8)
+  adv(sp: ptr, scale: i64, rvf: i64, res: ptr, rslot: ptr):
+    %sp2 = gep i8 sp, 1
+    br digloop(%sp2, scale, rvf, res, rslot)
+  after(sp: ptr, scale: i64, rvf: i64, res: ptr, rslot: ptr, c8: i8):
+    %isnl = icmp.eq i8 c8, 10
+    %sp2 = gep i8 sp, 1
+    %spn = select ptr %isnl, %sp2, sp
+    br finch(%spn, scale, rvf, res, rslot)
+  finch(sp: ptr, scale: i64, rvf: i64, res: ptr, rslot: ptr):
+    %c = load i8, sp
+    %nz = icmp.ne i8 %c, 0
+    condbr %nz, einval(), scaleup(scale, rvf, res, rslot)
+  scaleup(scale: i64, rvf: i64, res: ptr, rslot: ptr):
+    %v = load i64, rslot
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, sc2(%v, scale, rvf, res), ok(res, %v)
+  sc2(v: i64, scale: i64, rvf: i64, res: ptr):
+    %diff = sub i64 scale, rvf
+    %big = icmp.sgt i64 %diff, 19
+    condbr %big, erange(), sc3(v, %diff, res)
+  sc3(v: i64, diff: i64, res: ptr):
+    %p10 = call i64 int_pow(10, diff)
+    %prod = mul i64 v, %p10
+    %back = udiv i64 %prod, %p10
+    %movf = icmp.ne i64 %back, v
+    condbr %movf, erange(), ok(res, %prod)
+  ok(res: ptr, v: i64):
+    store i64 res, v
+    ret 0
+}
+
+fn kstrtoudec64(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, scale: i64, res: ptr):
+    %c = load i8, s
+    %plus = icmp.eq i8 %c, 43
+    %s2 = gep i8 s, 1
+    %sp = select ptr %plus, %s2, s
+    %r = call i64 kls_kstrtoudec64(%sp, scale, res)
+    ret %r
+}
+
+fn kstrtodec64(ptr, i64, ptr) -> i64 {
+  entry(s: ptr, scale: i64, res: ptr):
+    %c = load i8, s
+    %minus = icmp.eq i8 %c, 45
+    condbr %minus, neg(s, scale, res), pos(s, scale, res)
+  erange():
+    %m = sub i64 0, 34
+    ret %m
+  retv(v: i64):
+    ret v
+  neg(s: ptr, scale: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %s1 = gep i8 s, 1
+    %rv = call i64 kls_kstrtoudec64(%s1, scale, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), neg2(%tslot, res)
+  neg2(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %nt = sub i64 0, %tmp
+    %pos = icmp.sgt i64 %nt, 0
+    condbr %pos, erange(), negok(res, %nt)
+  negok(res: ptr, nt: i64):
+    store i64 res, %nt
+    ret 0
+  pos(s: ptr, scale: i64, res: ptr):
+    %tslot = alloca 8, 8
+    %rv = call i64 kstrtoudec64(s, scale, %tslot)
+    %bad = icmp.slt i64 %rv, 0
+    condbr %bad, retv(%rv), pos2(%tslot, res)
+  pos2(tslot: ptr, res: ptr):
+    %tmp = load i64, tslot
+    %negv = icmp.slt i64 %tmp, 0
+    condbr %negv, erange(), posok(res, %tmp)
+  posok(res: ptr, tmp: i64):
+    store i64 res, tmp
+    ret 0
+}

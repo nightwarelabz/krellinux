@@ -1,0 +1,15 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+; Krellinux Phase 1 conversion of lib/muldi3.c: __muldi3(long long, long long).
+;
+; The C original builds the product from 16-bit partial products
+; (umul_ppmm) because it targets compilers without a native 64-bit
+; multiply. Its result is exactly the low 64 bits of the product,
+; which is what Krell's mul i64 computes (arithmetic modulo 2^64).
+; Proven equal by the differential rig (tools/converge/rig/,
+; batch 2) over structured and random operand pairs, and against
+; a 128-bit oracle in the rig.
+fn __muldi3(i64, i64) -> i64 {
+  entry(u: i64, v: i64):
+    %r = mul i64 u, v
+    ret %r
+}

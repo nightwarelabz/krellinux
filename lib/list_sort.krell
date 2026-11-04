@@ -1,0 +1,194 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/list_sort.c converted to Krell (Phase 1 batch 6).
+;
+; The mergesort is the C algorithm operation for operation,
+; including the stability rule (on equality take from 'a').
+; struct list_head is two pointers: next at offset 0, prev
+; at offset 8.  Pointer-to-pointer walks in C (tail =
+; &node->next / &node->prev) become plain addresses here:
+; &node->next is the node pointer itself (offset 0) and
+; &node->prev is node+8.  The one place C takes the address
+; of a local (pending in list_sort, head in merge) uses an
+; 8-byte alloca slot holding the pointer.
+; NULL is materialized through the alloca bridge.
+
+sig kll_cmp(ptr, ptr, ptr) -> i32
+
+fn kll_ptrval(ptr) -> i64 {
+  entry(p: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    store ptr %slot, p
+    %v = load i64, %slot
+    ret %v
+}
+
+fn kll_null() -> ptr {
+  entry():
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    %p = load ptr, %slot
+    ret %p
+}
+
+fn kll_isnull(ptr) -> i64 {
+  entry(p: ptr):
+    %v = call i64 kll_ptrval(p)
+    %z = icmp.eq i64 %v, 0
+    %r = select i64 %z, 1, 0
+    ret %r
+}
+
+; merge: returns a null-terminated singly-linked list;
+; prev links are not maintained.
+fn kll_merge(ptr, ptr, ptr, ptr) -> ptr {
+  entry(priv: ptr, cmp: ptr, a: ptr, b: ptr):
+    %h = alloca 8, 8
+    store i64 %h, 0
+    br loop(priv, cmp, a, b, %h, %h)
+  loop(priv: ptr, cmp: ptr, a: ptr, b: ptr, tail: ptr, h: ptr):
+    %r = calli i32 kll_cmp %cmp(priv, a, b)
+    %rz = sext i64 %r
+    %le = icmp.sle i64 %rz, 0
+    condbr %le, take_a(priv, cmp, a, b, tail, h), take_b(priv, cmp, a, b, tail, h)
+  take_a(priv: ptr, cmp: ptr, a: ptr, b: ptr, tail: ptr, h: ptr):
+    store ptr %tail, a
+    %a2 = load ptr, a
+    %nz = call i64 kll_isnull(%a2)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, fin_b(a, b, h), loop(priv, cmp, %a2, b, a, h)
+  take_b(priv: ptr, cmp: ptr, a: ptr, b: ptr, tail: ptr, h: ptr):
+    store ptr %tail, b
+    %b2 = load ptr, b
+    %nz = call i64 kll_isnull(%b2)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, fin_a(b, a, h), loop(priv, cmp, a, %b2, b, h)
+  fin_b(tail: ptr, b: ptr, h: ptr):
+    store ptr %tail, b
+    %r = load ptr, %h
+    ret %r
+  fin_a(tail: ptr, a: ptr, h: ptr):
+    store ptr %tail, a
+    %r = load ptr, %h
+    ret %r
+}
+
+; merge_final: like merge, but restores prev links and
+; closes the circle through head.
+fn kll_merge_final(ptr, ptr, ptr, ptr, ptr) -> void {
+  entry(priv: ptr, cmp: ptr, head: ptr, a: ptr, b: ptr):
+    br loop(priv, cmp, head, a, b, head)
+  loop(priv: ptr, cmp: ptr, head: ptr, a: ptr, b: ptr, tail: ptr):
+    %r = calli i32 kll_cmp %cmp(priv, a, b)
+    %rz = sext i64 %r
+    %le = icmp.sle i64 %rz, 0
+    condbr %le, take_a(priv, cmp, head, a, b, tail), take_b(priv, cmp, head, a, b, tail)
+  take_a(priv: ptr, cmp: ptr, head: ptr, a: ptr, b: ptr, tail: ptr):
+    store ptr %tail, a
+    %ap = gep i8 a, 8
+    store ptr %ap, tail
+    %a2 = load ptr, a
+    %nz = call i64 kll_isnull(%a2)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, finish(head, b, a), loop(priv, cmp, head, %a2, b, a)
+  take_b(priv: ptr, cmp: ptr, head: ptr, a: ptr, b: ptr, tail: ptr):
+    store ptr %tail, b
+    %bp = gep i8 b, 8
+    store ptr %bp, tail
+    %b2 = load ptr, b
+    %nz = call i64 kll_isnull(%b2)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, use_a(head, a, b), loop(priv, cmp, head, a, %b2, b)
+  use_a(head: ptr, a: ptr, tail: ptr):
+    br finish(head, a, tail)
+  finish(head: ptr, b: ptr, tail: ptr):
+    store ptr %tail, b
+    br fin_loop(head, b, tail)
+  fin_loop(head: ptr, b: ptr, tail: ptr):
+    %bp = gep i8 b, 8
+    store ptr %bp, tail
+    %b2 = load ptr, b
+    %nz = call i64 kll_isnull(%b2)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, close(head, b), fin_loop(head, %b2, b)
+  close(head: ptr, tail: ptr):
+    store ptr %tail, head
+    %hp = gep i8 head, 8
+    store ptr %hp, tail
+    ret
+}
+
+fn list_sort(ptr, ptr, ptr) -> void {
+  entry(priv: ptr, head: ptr, cmp: ptr):
+    %list0 = load ptr, head
+    %hprev = gep i8 head, 8
+    %last = load ptr, %hprev
+    %lv = call i64 kll_ptrval(%list0)
+    %pv = call i64 kll_ptrval(%last)
+    %eq = icmp.eq i64 %lv, %pv
+    condbr %eq, done(), setup(priv, head, cmp, %list0, %last)
+  setup(priv: ptr, head: ptr, cmp: ptr, list: ptr, last: ptr):
+    %null = call ptr kll_null()
+    store ptr %last, %null
+    %pend = alloca 8, 8
+    store ptr %pend, %null
+    br round(priv, head, cmp, list, %pend, 0)
+  ; one round: merge per the count bits, then move one
+  ; element from the input to the pending stack.
+  round(priv: ptr, head: ptr, cmp: ptr, list: ptr, pend: ptr, count: i64):
+    br bits(priv, head, cmp, list, pend, count, count, pend)
+  bits(priv: ptr, head: ptr, cmp: ptr, list: ptr, pend: ptr, count: i64, bits: i64, tail: ptr):
+    %odd = and i64 bits, 1
+    %nz = icmp.ne i64 %odd, 0
+    condbr %nz, bits_step(priv, head, cmp, list, pend, count, bits, tail), bits_done(priv, head, cmp, list, pend, count, bits, tail)
+  bits_step(priv: ptr, head: ptr, cmp: ptr, list: ptr, pend: ptr, count: i64, bits: i64, tail: ptr):
+    %node = load ptr, %tail
+    %tp = gep i8 %node, 8
+    %b1 = lshr i64 bits, 1
+    br bits(priv, head, cmp, list, pend, count, %b1, %tp)
+  bits_done(priv: ptr, head: ptr, cmp: ptr, list: ptr, pend: ptr, count: i64, bits: i64, tail: ptr):
+    %nz = icmp.ne i64 bits, 0
+    condbr %nz, do_merge(priv, head, cmp, list, pend, count, tail), move(priv, head, cmp, list, pend, count)
+  do_merge(priv: ptr, head: ptr, cmp: ptr, list: ptr, pend: ptr, count: i64, tail: ptr):
+    %a = load ptr, %tail
+    %ap = gep i8 %a, 8
+    %b = load ptr, %ap
+    %m = call ptr kll_merge(priv, cmp, %b, %a)
+    %bp = gep i8 %b, 8
+    %bprev = load ptr, %bp
+    %mp = gep i8 %m, 8
+    store ptr %mp, %bprev
+    store ptr %tail, %m
+    br move(priv, head, cmp, list, pend, count)
+  move(priv: ptr, head: ptr, cmp: ptr, list: ptr, pend: ptr, count: i64):
+    %cur = load ptr, %pend
+    %lp = gep i8 list, 8
+    store ptr %lp, %cur
+    store ptr %pend, list
+    %next = load ptr, list
+    %null = call ptr kll_null()
+    store ptr %list, %null
+    %c1 = add i64 count, 1
+    %nz = call i64 kll_isnull(%next)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, final(priv, head, cmp, pend), round(priv, head, cmp, %next, pend, %c1)
+  final(priv: ptr, head: ptr, cmp: ptr, pend: ptr):
+    %list = load ptr, %pend
+    %lp = gep i8 %list, 8
+    %pending = load ptr, %lp
+    br fin_loop(priv, head, cmp, %list, %pending)
+  fin_loop(priv: ptr, head: ptr, cmp: ptr, list: ptr, pending: ptr):
+    %pp = gep i8 pending, 8
+    %next = load ptr, %pp
+    %nz = call i64 kll_isnull(%next)
+    %isn = icmp.ne i64 %nz, 0
+    condbr %isn, fin_call(priv, head, cmp, list, pending), fin_merge(priv, head, cmp, list, pending, %next)
+  fin_merge(priv: ptr, head: ptr, cmp: ptr, list: ptr, pending: ptr, next: ptr):
+    %m = call ptr kll_merge(priv, cmp, pending, list)
+    br fin_loop(priv, head, cmp, %m, %next)
+  fin_call(priv: ptr, head: ptr, cmp: ptr, list: ptr, pending: ptr):
+    call void kll_merge_final(priv, cmp, head, pending, list)
+    br done()
+  done():
+    ret
+}

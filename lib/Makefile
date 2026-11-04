@@ -358,11 +358,12 @@ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
 # in tools/converge/rig/ before it is recorded in CONVERSION.md.
 KRELLC ?= krellc
 obj-y += krell_phase1_check.o krell_string_check.o krell_batch4_check.o \
-	 krell_batch5_check.o \
+	 krell_batch5_check.o krell_batch6_check.o \
 	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
 	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o \
 	 string_krell.o kstrtox_krell.o cmdline_krell.o bsearch_krell.o \
-	 find_bit_krell.o bitmap_krell.o bitmap-str_krell.o
+	 find_bit_krell.o bitmap_krell.o bitmap-str_krell.o \
+	 sort_krell.o list_sort_krell.o
 
 krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
@@ -481,7 +482,12 @@ krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\bbitmap_parselist\b/krell_bitmap_parselist/g' \
 	-e 's/\bbitmap_parse\b/krell_bitmap_parse/g' \
 	-e 's/\bbitmap_print_bitmask_to_buf\b/krell_bitmap_print_bitmask_to_buf/g' \
-	-e 's/\bbitmap_print_list_to_buf\b/krell_bitmap_print_list_to_buf/g'
+	-e 's/\bbitmap_print_list_to_buf\b/krell_bitmap_print_list_to_buf/g' \
+	-e 's/\bsort_r_nonatomic\b/krell_sort_r_nonatomic/g' \
+	-e 's/\bsort_r\b/krell_sort_r/g' \
+	-e 's/\bsort_nonatomic\b/krell_sort_nonatomic/g' \
+	-e 's/\bsort\b/krell_sort/g' \
+	-e 's/\blist_sort\b/krell_list_sort/g'
 
 $(obj)/%_krell.krel: $(src)/%.krell FORCE
 	$(Q)$(KRELLC) parse $< -o $@

@@ -13,10 +13,25 @@ step.
 
 ## Status
 
-Starting point. The tree is currently unmodified upstream Linux (see
-[Upstream base](#upstream-base) below); no conversion work has landed yet.
-This README and the mascot are the first change to the fork. Conversion status
-will be tracked here as work lands.
+Phase 0 is complete: the conversion has begun, and the tree still builds
+and boots.
+
+- **Census.** The Auto-Convergence Engine (`tools/converge/`) has
+  classified all of `lib/` — 212 files, 3,418 function definitions:
+  83 AUTO (convertible with Krell as it stands), 104 ASSIST (blocked by
+  named Krell gaps), and 25 awaiting a config-faithful census. The
+  conversion ledger is [`CONVERSION.md`](CONVERSION.md); per-file
+  blockers are in `tools/converge/CENSUS-lib.md`.
+- **First conversion.** `crc16` (`lib/crc/`) is rewritten in Krell and
+  proven equal to its C original on a 3,563-case differential corpus,
+  with zero divergence.
+- **Integration spike.** Kbuild compiles `.krell` sources through
+  krellc into vmlinux; the Krell crc16 runs inside the booted kernel
+  and passes its boot-time self-check (verified in QEMU).
+
+Next: Phase 1 — converting the AUTO class of `lib/`, function by
+function, each one proven against its C original before it replaces
+it.
 
 ## What is Krell?
 
@@ -32,10 +47,10 @@ readers.
   bounded fragment superoptimizer
 - Backends: x86_64, AArch64, RISC-V 64, and an LLVM lane
 
-On the twelve KRELLPROOF kernels, Krell v2.1 compiles code measured at
-1.58× the speed of C -O2 (native x86_64) and 1.59× (LLVM lane) —
+On the twelve KRELLPROOF kernels, Krell v2.2 compiles code measured at
+1.66× the speed of C -O2 (native x86_64) and 1.58× (LLVM lane) —
 geometric mean, Fibonacci excluded. Full record:
-[Krell v2.1 release](https://github.com/nightwarelabz/krell/releases/tag/v2.1).
+[Krell v2.2 release](https://github.com/nightwarelabz/krell/releases/tag/v2.2).
 
 Krell is licensed under Apache-2.0, with the Krell Encoding Exception:
 Krell-encoded programs are not derivative works and carry no license

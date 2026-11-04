@@ -1,0 +1,109 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Krellinux Phase 1 conversion of lib/crc/crc8.c:
+; crc8_populate_msb(), crc8_populate_lsb(), crc8().
+;
+; Unlike the fixed-polynomial CRCs, crc8 is table-generic: the
+; caller builds a 256-entry table for its polynomial with one of
+; the populate functions, and crc8() walks the buffer through it.
+; The Krell forms keep that structure exactly -- the populate
+; functions write the same tables byte for byte, and crc8() reads
+; the caller's table through the pointer it is given. Proven
+; equal by the differential rig (tools/converge/rig/, batch 2):
+; full 256-byte tables compared for a spread of polynomials, and
+; crc8() compared over random buffers and inits for both table
+; kinds.
+fn crc8(ptr, ptr, i64, i64) -> i64 {
+  entry(tab: ptr, buf: ptr, len: i64, crc: i64):
+    br loop(0, crc, tab, buf, len, 255)
+  loop(i: i64, c: i64, tab: ptr, buf: ptr, len: i64, m255: i64):
+    %t = icmp.slt i64 i, len
+    condbr %t, body(i, c, tab, buf, len, m255), done(c)
+  body(i: i64, c: i64, tab: ptr, buf: ptr, len: i64, m255: i64):
+    %p = gep i8 buf, i
+    %b = load i8, %p
+    %bv = zext i64 %b
+    %idx = xor i64 c, %bv
+    %idxm = and i64 %idx, m255
+    %tp = gep i8 tab, %idxm
+    %tv = load i8, %tp
+    %nc = zext i64 %tv
+    %i2 = add i64 i, 1
+    br loop(%i2, %nc, tab, buf, len, m255)
+  done(c: i64):
+    ret c
+}
+
+fn crc8_populate_msb(ptr, i64) -> void {
+  entry(tab: ptr, poly: i64):
+    %p0 = gep i8 tab, 0
+    store i8 %p0, 0
+    br outer(1, 128, tab, poly, 1, 255, 128, 256)
+  outer(i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, msb: i64, lim: i64):
+    %c = icmp.slt i64 i, lim
+    condbr %c, obody(i, t, tab, poly, one, m255, msb, lim), done()
+  obody(i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, msb: i64, lim: i64):
+    %tm = and i64 t, msb
+    %nz = icmp.ne i64 %tm, 0
+    %pv = select i64 %nz, poly, 0
+    %sh = shl i64 t, one
+    %x = xor i64 %sh, %pv
+    %t2 = and i64 %x, m255
+    br inner(0, i, %t2, tab, poly, one, m255, msb, lim)
+  inner(j: i64, i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, msb: i64, lim: i64):
+    %c = icmp.slt i64 j, i
+    condbr %c, ibody(j, i, t, tab, poly, one, m255, msb, lim), inext(i, t, tab, poly, one, m255, msb, lim)
+  ibody(j: i64, i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, msb: i64, lim: i64):
+    %pj = gep i8 tab, j
+    %old = load i8, %pj
+    %ov = zext i64 %old
+    %nv = xor i64 %ov, t
+    %n8 = trunc i8 %nv
+    %ij = add i64 i, j
+    %pd = gep i8 tab, %ij
+    store i8 %pd, %n8
+    %j2 = add i64 j, one
+    br inner(%j2, i, t, tab, poly, one, m255, msb, lim)
+  inext(i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, msb: i64, lim: i64):
+    %i2 = shl i64 i, one
+    br outer(%i2, t, tab, poly, one, m255, msb, lim)
+  done():
+    ret
+}
+
+fn crc8_populate_lsb(ptr, i64) -> void {
+  entry(tab: ptr, poly: i64):
+    %p0 = gep i8 tab, 0
+    store i8 %p0, 0
+    br outer(128, 1, tab, poly, 1, 255, 256)
+  outer(i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, lim: i64):
+    %c = icmp.ne i64 i, 0
+    condbr %c, obody(i, t, tab, poly, one, m255, lim), done()
+  obody(i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, lim: i64):
+    %tm = and i64 t, one
+    %nz = icmp.ne i64 %tm, 0
+    %pv = select i64 %nz, poly, 0
+    %sh = lshr i64 t, one
+    %x = xor i64 %sh, %pv
+    %t2 = and i64 %x, m255
+    %step = shl i64 i, one
+    br inner(0, i, %t2, tab, poly, one, m255, lim, %step)
+  inner(j: i64, i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, lim: i64, step: i64):
+    %c = icmp.slt i64 j, lim
+    condbr %c, ibody(j, i, t, tab, poly, one, m255, lim, step), inext(i, t, tab, poly, one, m255, lim)
+  ibody(j: i64, i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, lim: i64, step: i64):
+    %pj = gep i8 tab, j
+    %old = load i8, %pj
+    %ov = zext i64 %old
+    %nv = xor i64 %ov, t
+    %n8 = trunc i8 %nv
+    %ij = add i64 i, j
+    %pd = gep i8 tab, %ij
+    store i8 %pd, %n8
+    %j2 = add i64 j, step
+    br inner(%j2, i, t, tab, poly, one, m255, lim, step)
+  inext(i: i64, t: i64, tab: ptr, poly: i64, one: i64, m255: i64, lim: i64):
+    %i2 = lshr i64 i, one
+    br outer(%i2, t, tab, poly, one, m255, lim)
+  done():
+    ret
+}

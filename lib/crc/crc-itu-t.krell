@@ -1,0 +1,41 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Krellinux Phase 1 conversion of lib/crc/crc-itu-t.c: crc_itu_t().
+;
+; The C original is table-driven (crc_itu_t_table), MSB-first for
+; polynomial x^16 + x^12 + x^5 + 1 (0x1021). The Krell form is the
+; same CRC computed bit at a time, MSB-first: each byte is XORed
+; into the top of the register, then eight shifts feed back the
+; polynomial whenever the outgoing top bit is set. The table data
+; itself is not converted; it stays in the C file. Proven equal by
+; the differential rig (tools/converge/rig/, batch 2).
+fn crc_itu_t(i64, ptr, i64) -> i64 {
+  entry(crc: i64, buf: ptr, len: i64):
+    br loop(0, crc, buf, len, 1, 4129, 65535)
+  loop(i: i64, c: i64, buf: ptr, len: i64, one: i64, poly: i64, mask: i64):
+    %t = icmp.slt i64 i, len
+    condbr %t, body(i, c, buf, len, one, poly, mask), done(c)
+  body(i: i64, c: i64, buf: ptr, len: i64, one: i64, poly: i64, mask: i64):
+    %p = gep i8 buf, i
+    %b = load i8, %p
+    %bv = zext i64 %b
+    %sh8 = shl i64 %bv, 8
+    %x = xor i64 c, %sh8
+    br bits(8, %x, i, buf, len, one, poly, mask)
+  bits(n: i64, v: i64, i: i64, buf: ptr, len: i64, one: i64, poly: i64, mask: i64):
+    %tn = icmp.sgt i64 n, 0
+    condbr %tn, bit(n, v, i, buf, len, one, poly, mask), next(v, i, buf, len, one, poly, mask)
+  bit(n: i64, v: i64, i: i64, buf: ptr, len: i64, one: i64, poly: i64, mask: i64):
+    %top = lshr i64 v, 15
+    %sh = shl i64 v, one
+    %shm = and i64 %sh, mask
+    %neg = sub i64 0, %top
+    %pm = and i64 poly, %neg
+    %nv = xor i64 %shm, %pm
+    %n2 = sub i64 n, one
+    br bits(%n2, %nv, i, buf, len, one, poly, mask)
+  next(v: i64, i: i64, buf: ptr, len: i64, one: i64, poly: i64, mask: i64):
+    %i2 = add i64 i, one
+    br loop(%i2, v, buf, len, one, poly, mask)
+  done(c: i64):
+    ret c
+}

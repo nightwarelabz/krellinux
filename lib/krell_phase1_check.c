@@ -24,6 +24,7 @@ extern long long krell___cmpdi2(long long a, long long b);
 extern long long krell___ucmpdi2(long long a, long long b);
 extern int krell__bcd2bin(int v);
 extern int krell__bin2bcd(int v);
+extern long long krell___muldi3(long long u, long long v);
 
 static const long long krell_check_vals[] = {
 	0, 1, -1, 2, -2, 100, -100,
@@ -72,6 +73,16 @@ static int krell_phase1_check(void)
 				fails++;
 		}
 	}
+	for (i = 0; i < (sizeof(krell_check_vals) / sizeof(krell_check_vals[0])); i++) {
+		for (j = 0; j < (sizeof(krell_check_vals) / sizeof(krell_check_vals[0])); j++) {
+			long long a = krell_check_vals[i];
+			long long c = krell_check_vals[j];
+
+			cases++;
+			if (krell___muldi3(a, c) != a * c)
+				fails++;
+		}
+	}
 	for (v = 0; v < 256; v++) {
 		cases++;
 		if (krell__bcd2bin(v) != (int)((v & 0x0f) + ((v >> 4) * 10)))
@@ -83,7 +94,7 @@ static int krell_phase1_check(void)
 			fails++;
 	}
 
-	pr_info("krellinux: phase1 batch1 libgcc+bcd cases=%ld fails=%ld %s\n",
+	pr_info("krellinux: phase1 libgcc+bcd cases=%ld fails=%ld %s\n",
 		cases, fails, fails ? "MISMATCH" : "MATCH");
 	return 0;
 }

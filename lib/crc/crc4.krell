@@ -1,0 +1,48 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Krellinux Phase 1 conversion of lib/crc/crc4.c: crc4().
+;
+; The C original walks the value in nibbles, MSB first, through a
+; 16-entry table (polynomial x^4 + x^2 + x + 1). A table step
+; c = tab[c ^ nibble] is exactly: XOR the nibble into the register,
+; then run four bit steps whose feedback is the register's top
+; bit, XORing the truncated polynomial 0x7 when it is set. The
+; Krell form performs those steps directly; the masking and the
+; nibble alignment are the C code's own. Defined domain: bit
+; counts 0..63 (the C mask expression is undefined outside it).
+; Proven equal by the differential rig (tools/converge/rig/,
+; batch 2) over every bit count in the domain.
+fn crc4(i64, i64, i64) -> i64 {
+  entry(c: i64, x: i64, bits: i64):
+    %sh = shl i64 1, bits
+    %mask = sub i64 %sh, 1
+    %xm = and i64 x, %mask
+    %bp3 = add i64 bits, 3
+    %al = and i64 %bp3, -4
+    %i0 = sub i64 %al, 4
+    br loop(%i0, c, %xm, 1, 15)
+  loop(i: i64, c: i64, x: i64, one: i64, m15: i64):
+    %t = icmp.sge i64 i, 0
+    condbr %t, nib(i, c, x, one, m15), done(c)
+  nib(i: i64, c: i64, x: i64, one: i64, m15: i64):
+    %shx = lshr i64 x, i
+    %idx = and i64 %shx, m15
+    %c2 = xor i64 c, %idx
+    br steps(4, %c2, i, x, one, m15)
+  steps(k: i64, c: i64, i: i64, x: i64, one: i64, m15: i64):
+    %tk = icmp.sgt i64 k, 0
+    condbr %tk, step(k, c, i, x, one, m15), after(c, i, x, one, m15)
+  step(k: i64, c: i64, i: i64, x: i64, one: i64, m15: i64):
+    %fb = lshr i64 c, 3
+    %sh = shl i64 c, one
+    %shm = and i64 %sh, m15
+    %neg = sub i64 0, %fb
+    %pm = and i64 7, %neg
+    %nc = xor i64 %shm, %pm
+    %k2 = sub i64 k, one
+    br steps(%k2, %nc, i, x, one, m15)
+  after(c: i64, i: i64, x: i64, one: i64, m15: i64):
+    %i2 = sub i64 i, 4
+    br loop(%i2, c, x, one, m15)
+  done(c: i64):
+    ret c
+}

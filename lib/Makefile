@@ -359,7 +359,7 @@ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
 KRELLC ?= krellc
 obj-y += krell_phase1_check.o \
 	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
-	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o
+	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o
 
 krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
@@ -367,7 +367,8 @@ krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__cmpdi2\b/krell___cmpdi2/g' \
 	-e 's/\b__ucmpdi2\b/krell___ucmpdi2/g' \
 	-e 's/\b_bcd2bin\b/krell__bcd2bin/g' \
-	-e 's/\b_bin2bcd\b/krell__bin2bcd/g'
+	-e 's/\b_bin2bcd\b/krell__bin2bcd/g' \
+	-e 's/\b__muldi3\b/krell___muldi3/g'
 
 $(obj)/%_krell.krel: $(src)/%.krell FORCE
 	$(Q)$(KRELLC) parse $< -o $@

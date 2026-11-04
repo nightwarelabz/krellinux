@@ -85,3 +85,62 @@ $(obj)/crc16_krell.s: $(obj)/crc16_krell.krel FORCE
 
 $(obj)/crc16_krell.o: $(obj)/crc16_krell.s FORCE
 	$(Q)$(CC) -c -o $@ $<
+
+# Krellinux Phase 1 batch 2: Krell conversions of the remaining small
+# CRC files, built the same way as the Phase 0 spike and self-checked
+# at boot by krell_crc_check.o. Each conversion is proven against its
+# C original by the differential rig in tools/converge/rig/ (batch 2).
+obj-y += krell_crc_check.o crc_ccitt_krell.o crc_itu_t_krell.o \
+	 crc4_krell.o crc7_krell.o crc8_krell.o
+
+$(obj)/crc_ccitt_krell.krel: $(src)/crc-ccitt.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/crc_ccitt_krell.s: $(obj)/crc_ccitt_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+		sed 's/\bcrc_ccitt\b/krell_crc_ccitt/g' $@.tmp > $@ && rm $@.tmp
+
+$(obj)/crc_ccitt_krell.o: $(obj)/crc_ccitt_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<
+
+$(obj)/crc_itu_t_krell.krel: $(src)/crc-itu-t.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/crc_itu_t_krell.s: $(obj)/crc_itu_t_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+		sed 's/\bcrc_itu_t\b/krell_crc_itu_t/g' $@.tmp > $@ && rm $@.tmp
+
+$(obj)/crc_itu_t_krell.o: $(obj)/crc_itu_t_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<
+
+$(obj)/crc4_krell.krel: $(src)/crc4.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/crc4_krell.s: $(obj)/crc4_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+		sed 's/\bcrc4\b/krell_crc4/g' $@.tmp > $@ && rm $@.tmp
+
+$(obj)/crc4_krell.o: $(obj)/crc4_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<
+
+$(obj)/crc7_krell.krel: $(src)/crc7.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/crc7_krell.s: $(obj)/crc7_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+		sed 's/\bcrc7_be\b/krell_crc7_be/g' $@.tmp > $@ && rm $@.tmp
+
+$(obj)/crc7_krell.o: $(obj)/crc7_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<
+
+$(obj)/crc8_krell.krel: $(src)/crc8.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/crc8_krell.s: $(obj)/crc8_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+		sed -e 's/\bcrc8_populate_msb\b/krell_crc8_populate_msb/g' \
+		    -e 's/\bcrc8_populate_lsb\b/krell_crc8_populate_lsb/g' \
+		    -e 's/\bcrc8\b/krell_crc8/g' $@.tmp > $@ && rm $@.tmp
+
+$(obj)/crc8_krell.o: $(obj)/crc8_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<

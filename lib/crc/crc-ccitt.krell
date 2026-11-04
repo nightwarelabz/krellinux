@@ -1,0 +1,41 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; Krellinux Phase 1 conversion of lib/crc/crc-ccitt.c: crc_ccitt().
+;
+; The C original is table-driven (crc_ccitt_table, the reflected
+; CRC of each byte, polynomial x^16 + x^12 + x^5 + 1). The Krell
+; form is the same CRC computed bit at a time with the reflected
+; polynomial 0x8408 -- the method the table's own header comment
+; names ("It can be computed using the standard bit-at-a-time
+; methods"), and the form Phase 0 proved for crc16. The 256-entry
+; table data itself is not converted; it stays in the C file.
+; Proven equal by the differential rig (tools/converge/rig/,
+; batch 2) on structured and random buffers and inits.
+fn crc_ccitt(i64, ptr, i64) -> i64 {
+  entry(crc: i64, buf: ptr, len: i64):
+    br loop(0, crc, buf, len, 1, 33800)
+  loop(i: i64, c: i64, buf: ptr, len: i64, one: i64, poly: i64):
+    %t = icmp.slt i64 i, len
+    condbr %t, body(i, c, buf, len, one, poly), done(c)
+  body(i: i64, c: i64, buf: ptr, len: i64, one: i64, poly: i64):
+    %p = gep i8 buf, i
+    %b = load i8, %p
+    %bv = zext i64 %b
+    %x = xor i64 c, %bv
+    br bits(8, %x, i, buf, len, one, poly)
+  bits(n: i64, v: i64, i: i64, buf: ptr, len: i64, one: i64, poly: i64):
+    %tn = icmp.sgt i64 n, 0
+    condbr %tn, bit(n, v, i, buf, len, one, poly), next(v, i, buf, len, one, poly)
+  bit(n: i64, v: i64, i: i64, buf: ptr, len: i64, one: i64, poly: i64):
+    %lsb = and i64 v, one
+    %sh = lshr i64 v, one
+    %neg = sub i64 0, %lsb
+    %pm = and i64 poly, %neg
+    %nv = xor i64 %sh, %pm
+    %n2 = sub i64 n, one
+    br bits(%n2, %nv, i, buf, len, one, poly)
+  next(v: i64, i: i64, buf: ptr, len: i64, one: i64, poly: i64):
+    %i2 = add i64 i, one
+    br loop(%i2, v, buf, len, one, poly)
+  done(c: i64):
+    ret c
+}

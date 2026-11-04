@@ -1,0 +1,33 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; lib/math/lcm.c, rewritten in Krell for the Krellinux conversion.
+;
+; lcm(a, b) = (a / gcd(a, b)) * b when both are nonzero, else 0;
+; the multiply wraps modulo 2^64 exactly as in C.  gcd is the
+; Krell gcd from gcd.krell (an external call here; the build
+; renames it to krell_gcd like the definition).
+extern gcd(i64, i64) -> i64
+
+fn lcm(i64, i64) -> i64 {
+  entry(a: i64, b: i64):
+    %za = icmp.eq i64 a, 0
+    %zb = icmp.eq i64 b, 0
+    %any = or i1 %za, %zb
+    condbr %any, zero(), work(a, b)
+  work(a: i64, b: i64):
+    %g = call i64 gcd(a, b)
+    %q = udiv i64 a, %g
+    %r = mul i64 %q, b
+    ret %r
+  zero():
+    ret 0
+}
+
+fn lcm_not_zero(i64, i64) -> i64 {
+  entry(a: i64, b: i64):
+    %l = call i64 lcm(a, b)
+    %z = icmp.eq i64 %l, 0
+    %bnz = icmp.ne i64 b, 0
+    %alt = select i64 %bnz, b, a
+    %r = select i64 %z, %alt, %l
+    ret %r
+}

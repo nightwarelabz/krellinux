@@ -1,0 +1,53 @@
+; SPDX-License-Identifier: GPL-2.0-only
+; lib/bsearch.c, rewritten in Krell for the Krellinux conversion.
+;
+; The C file is a one-line wrapper over __inline_bsearch() from
+; include/linux/bsearch.h; this form is that algorithm:
+;
+;   while (num > 0) {
+;       pivot = base + (num >> 1) * size;
+;       result = cmp(key, pivot);
+;       if (result == 0) return pivot;
+;       if (result > 0) { base = pivot + size; num--; }
+;       num >>= 1;
+;   }
+;   return NULL;
+;
+; cmp is a function pointer: the call goes through Krell's
+; indirect call with the cmp_func_t signature (ptr, ptr) -> i32.
+; The i32 return keeps the comparison on the C int in eax alone,
+; exactly as the C caller reads it.  NULL is materialized by
+; type-punning 0 through an alloca slot (Krell has no null
+; pointer constant).
+sig cmp_f(ptr, ptr) -> i32
+
+fn bsearch(ptr, ptr, i64, i64, ptr) -> ptr {
+  entry(key: ptr, base: ptr, num: i64, size: i64, cmp: ptr):
+    br loop(base, num)
+  loop(base: ptr, num: i64):
+    %nz = icmp.sgt i64 num, 0
+    condbr %nz, body(base, num), miss()
+  body(base: ptr, num: i64):
+    %half = lshr i64 num, 1
+    %off = mul i64 %half, size
+    %pivot = gep i8 base, %off
+    %r32 = calli i32 cmp_f cmp(key, %pivot)
+    %r = sext i64 %r32
+    %z = icmp.eq i64 %r, 0
+    condbr %z, found(%pivot), sgn(base, num, %pivot, %r)
+  sgn(base: ptr, num: i64, pivot: ptr, r: i64):
+    %pos = icmp.sgt i64 r, 0
+    %num1 = sub i64 num, 1
+    %base2 = gep i8 pivot, size
+    %nb = select ptr %pos, %base2, base
+    %nn = select i64 %pos, %num1, num
+    %half = lshr i64 %nn, 1
+    br loop(%nb, %half)
+  found(pivot: ptr):
+    ret pivot
+  miss():
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    %n = load ptr, %slot
+    ret %n
+}

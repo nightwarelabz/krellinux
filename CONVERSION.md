@@ -24,7 +24,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/bitmap.c` | C | AUTO | - |
 | `lib/bitrev.c` | C | AUTO | - |
 | `lib/bootconfig.c` | C | ASSIST | inline asm |
-| `lib/bsearch.c` | C | AUTO | - |
+| `lib/bsearch.c` | KRELL (function) | AUTO | bsearch() rewritten in Krell (lib/bsearch.krell): the C file is a wrapper over __inline_bsearch() from include/linux/bsearch.h, and the Krell form is that algorithm, with the comparator reached through an indirect call on its C signature (ptr, ptr) -> int; differential rig vs the header algorithm: part of the batch 4 rig (215,447 cases across the batch, 0 divergence), including a comparator with poisoned upper return bits; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 4). The C file still provides the symbol. |
 | `lib/btree.c` | C | ASSIST | indirect calls / function pointers; inline asm |
 | `lib/bucket_locks.c` | C | AUTO | - |
 | `lib/bug.c` | C | ASSIST | varargs |
@@ -36,7 +36,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/closure.c` | C | ASSIST | indirect calls / function pointers; atomics beyond load/store/add; inline asm |
 | `lib/clz_ctz.c` | C | AUTO | - |
 | `lib/clz_tab.c` | C | AUTO | - |
-| `lib/cmdline.c` | C | AUTO | - |
+| `lib/cmdline.c` | KRELL (functions) | AUTO | get_option, get_options, memparse, parse_option_str and next_arg rewritten in Krell (lib/cmdline.krell), with the file-local get_range as an internal helper; differential rig vs the C original: part of the batch 4 rig (215,447 cases across the batch, 0 divergence); Krell objects linked into vmlinux and self-checked at boot (Phase 1 batch 4). simple_strtoull/simple_strtol, skip_spaces and strlen/strncmp are called externally, as in C. The C file still provides the symbols. |
 | `lib/cmpdi2.c` | KRELL (function) | AUTO | __cmpdi2() rewritten in Krell (lib/cmpdi2.krell); differential rig vs the C original: 60,225 cases (structured cross-product plus random and near-equal pairs), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbol where configured. |
 | `lib/cmpxchg-emu.c` | C | ASSIST | atomics beyond load/store/add; volatile; inline asm |
 | `lib/codetag.c` | C | ASSIST | indirect calls / function pointers; inline asm |
@@ -107,7 +107,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/klist.c` | C | ASSIST | indirect calls / function pointers; atomics beyond load/store/add; inline asm |
 | `lib/kobject.c` | C | ASSIST | indirect calls / function pointers; varargs; inline asm |
 | `lib/kobject_uevent.c` | C | ASSIST | indirect calls / function pointers; atomics beyond load/store/add; varargs; inline asm |
-| `lib/kstrtox.c` | C | AUTO | - |
+| `lib/kstrtox.c` | KRELL (functions) | AUTO | 17 of 28 functions rewritten in Krell (lib/kstrtox.krell): _parse_integer_fixup_radix, _parse_integer_limit, the kstrtoull/kstrtoll family and its width wrappers, kstrtobool, and the kstrtoudec64/kstrtodec64 scaled decimals; differential rig vs the C original: part of the batch 4 rig (215,447 cases across the batch, 0 divergence); Krell objects linked into vmlinux and self-checked at boot (Phase 1 batch 4). Residue: the 11 *_from_user wrappers stay C -- they stage the user string in a stack buffer of 11 to 67 bytes, and the current Krell native backend addresses an alloca region from its top, so writes past the first 8 bytes of a buffer overwrite the frame (batch 4 record has the reproducer); the wrappers convert when a compiler with the alloca fix is pinned. The C file still provides the symbols. |
 | `lib/linear_ranges.c` | C | AUTO | - |
 | `lib/list_debug.c` | C | AUTO | - |
 | `lib/list_sort.c` | C | AUTO | - |
@@ -226,5 +226,9 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/crc/crc4.c` | KRELL (function) | - | crc4() rewritten in Krell (lib/crc/crc4.krell, table step performed as four bit steps); differential rig vs the C original: 62,048 cases (every bit count 0..63 in the defined domain), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 2). |
 | `lib/crc/crc7.c` | KRELL (function) | - | crc7_be() rewritten in Krell (lib/crc/crc7.krell, bitwise MSB-first form, polynomial x^7 + x^3 + 1); differential rig vs the C original: 3,060 cases, 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 2). The table data and the C function remain in the C file. |
 | `lib/crc/crc8.c` | KRELL (functions) | - | crc8(), crc8_populate_msb() and crc8_populate_lsb() rewritten in Krell (lib/crc/crc8.krell, table-generic structure kept); differential rig vs the C originals: 8,020 cases including full 256-byte table comparisons for ten polynomials, 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 2). |
+| `lib/math/gcd.c` | KRELL (function) | - | gcd() rewritten in Krell (lib/math/gcd.krell), following the binary GCD the C file selects on its static key (the fallback loop computes the same gcd; the choice is result-invariant); differential rig vs the C original: part of the batch 4 rig (215,447 cases across the batch, 0 divergence); Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 4). The C file still provides the symbol. |
+| `lib/math/lcm.c` | KRELL (functions) | - | lcm() and lcm_not_zero() rewritten in Krell (lib/math/lcm.krell), calling the Krell gcd; differential rig vs the C originals: part of the batch 4 rig (215,447 cases across the batch, 0 divergence); Krell objects linked into vmlinux and self-checked at boot (Phase 1 batch 4). The C file still provides the symbols. |
+| `lib/math/int_pow.c` | KRELL (function) | - | int_pow() rewritten in Krell (lib/math/int_pow.krell); differential rig vs the C original: part of the batch 4 rig (215,447 cases across the batch, 0 divergence); Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 4). The C file still provides the symbol. |
+| `lib/math/int_sqrt.c` | KRELL (function) | - | int_sqrt() rewritten in Krell (lib/math/int_sqrt.krell), the C file's shift-and-subtract algorithm operation for operation; differential rig vs the C original: part of the batch 4 rig (215,447 cases across the batch, 0 divergence), including the full 0..100000 range; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 4). int_sqrt64() is compiled only when BITS_PER_LONG < 64 and has no x86_64 instance. The C file still provides the symbol. |
 
 Directories beyond lib/ enter the ledger as their phase's census completes.

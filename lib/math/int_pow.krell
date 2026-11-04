@@ -1,0 +1,27 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/math/int_pow.c, rewritten in Krell for the Krellinux
+; conversion.
+;
+; int_pow(base, exp): exponentiation by squaring over u64; the
+; result wraps modulo 2^64 exactly as in C.  exp is an unsigned
+; int argument: it is truncated to 32 bits on entry, the width
+; the C ABI guarantees for it.
+fn int_pow(i64, i64) -> i64 {
+  entry(base: i64, exp: i64):
+    %e32 = trunc i32 exp
+    %e = zext i64 %e32
+    br loop(base, %e, 1)
+  loop(base: i64, e: i64, res: i64):
+    %nz = icmp.ne i64 e, 0
+    condbr %nz, body(base, e, res), done(res)
+  body(base: i64, e: i64, res: i64):
+    %bit = and i64 e, 1
+    %hit = icmp.ne i64 %bit, 0
+    %res2 = mul i64 res, base
+    %nr = select i64 %hit, %res2, res
+    %ne = lshr i64 e, 1
+    %nb = mul i64 base, base
+    br loop(%nb, %ne, %nr)
+  done(res: i64):
+    ret res
+}

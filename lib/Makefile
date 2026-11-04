@@ -357,10 +357,10 @@ subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
 # conversion is proven against its C original by the differential rig
 # in tools/converge/rig/ before it is recorded in CONVERSION.md.
 KRELLC ?= krellc
-obj-y += krell_phase1_check.o krell_string_check.o \
+obj-y += krell_phase1_check.o krell_string_check.o krell_batch4_check.o \
 	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
 	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o muldi3_krell.o \
-	 string_krell.o
+	 string_krell.o kstrtox_krell.o cmdline_krell.o bsearch_krell.o
 
 krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
@@ -402,7 +402,29 @@ krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
 	-e 's/\bstrstr\b/krell_strstr/g' \
 	-e 's/\bstrnstr\b/krell_strnstr/g' \
 	-e 's/\bmemchr\b/krell_memchr/g' \
-	-e 's/\bmemchr_inv\b/krell_memchr_inv/g'
+	-e 's/\bmemchr_inv\b/krell_memchr_inv/g' \
+	-e 's/\b_parse_integer_fixup_radix\b/krell__parse_integer_fixup_radix/g' \
+	-e 's/\b_parse_integer_limit\b/krell__parse_integer_limit/g' \
+	-e 's/\bkstrtoull\b/krell_kstrtoull/g' \
+	-e 's/\bkstrtoll\b/krell_kstrtoll/g' \
+	-e 's/\b_kstrtoul\b/krell__kstrtoul/g' \
+	-e 's/\b_kstrtol\b/krell__kstrtol/g' \
+	-e 's/\bkstrtouint\b/krell_kstrtouint/g' \
+	-e 's/\bkstrtoint\b/krell_kstrtoint/g' \
+	-e 's/\bkstrtou16\b/krell_kstrtou16/g' \
+	-e 's/\bkstrtos16\b/krell_kstrtos16/g' \
+	-e 's/\bkstrtou8\b/krell_kstrtou8/g' \
+	-e 's/\bkstrtos8\b/krell_kstrtos8/g' \
+	-e 's/\bkstrtobool\b/krell_kstrtobool/g' \
+	-e 's/\bkstrtoudec64\b/krell_kstrtoudec64/g' \
+	-e 's/\bkstrtodec64\b/krell_kstrtodec64/g' \
+	-e 's/\bint_pow\b/krell_int_pow/g' \
+	-e 's/\bget_options\b/krell_get_options/g' \
+	-e 's/\bget_option\b/krell_get_option/g' \
+	-e 's/\bmemparse\b/krell_memparse/g' \
+	-e 's/\bparse_option_str\b/krell_parse_option_str/g' \
+	-e 's/\bnext_arg\b/krell_next_arg/g' \
+	-e 's/\bbsearch\b/krell_bsearch/g'
 
 $(obj)/%_krell.krel: $(src)/%.krell FORCE
 	$(Q)$(KRELLC) parse $< -o $@

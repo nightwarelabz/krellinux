@@ -1,0 +1,40 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/math/int_sqrt.c, rewritten in Krell for the Krellinux
+; conversion.
+;
+; int_sqrt(x): the shift-and-subtract algorithm from the C file,
+; operation for operation.  __fls(x) (index of the highest set
+; bit) is 63 - clz(x) for the x > 1 handled here.
+;
+; int_sqrt64() exists in the C file only when BITS_PER_LONG < 64;
+; it is not compiled on x86_64 and is not part of this form.
+fn int_sqrt(i64) -> i64 {
+  entry(x: i64):
+    %le = icmp.ule i64 x, 1
+    condbr %le, done(x), work(x)
+  work(x: i64):
+    %c = clz i64 x
+    %fls = sub i64 63, %c
+    %nm1 = sub i64 0, 2
+    %e = and i64 %fls, %nm1
+    %m = shl i64 1, %e
+    br loop(x, 0, %m)
+  loop(x: i64, y: i64, m: i64):
+    %nz = icmp.ne i64 m, 0
+    condbr %nz, body(x, y, m), done(y)
+  body(x: i64, y: i64, m: i64):
+    %b = add i64 y, m
+    %y1 = lshr i64 y, 1
+    %ge = icmp.uge i64 x, %b
+    condbr %ge, take(x, y, m, %b, %y1), skip(x, %y1, m)
+  take(x: i64, y: i64, m: i64, b: i64, y1: i64):
+    %x2 = sub i64 x, b
+    %y2 = add i64 y1, m
+    %m2 = lshr i64 m, 2
+    br loop(%x2, %y2, %m2)
+  skip(x: i64, y1: i64, m: i64):
+    %m2 = lshr i64 m, 2
+    br loop(x, y1, %m2)
+  done(v: i64):
+    ret v
+}

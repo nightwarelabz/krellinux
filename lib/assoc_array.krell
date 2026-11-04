@@ -1,0 +1,2242 @@
+; SPDX-License-Identifier: GPL-2.0
+; lib/assoc_array.c converted to Krell (Phase 1 batch 7).
+;
+; The associative array is the C algorithm operation for
+; operation.  Layout (x86_64): struct assoc_array { root
+; @0, nr_leaves_on_tree @8 }; struct assoc_array_ops {
+; get_key_chunk @0, get_object_key_chunk @8,
+; compare_object @16, diff_objects @24, free_object @32 };
+; struct assoc_array_node { back_pointer @0, parent_slot
+; (u8) @8, slots[16] @16, nr_leaves_on_branch @144 } (152
+; bytes); struct assoc_array_shortcut { back_pointer @0,
+; parent_slot (int) @8, skip_to_level (int) @12, next_node
+; @16, index_key[] @24 }; struct assoc_array_edit is 328
+; bytes with fields as noted at each use.
+;
+; Internal pointers are tagged in the low two bits (bit0:
+; meta; bit1: shortcut subtype) and are carried here as
+; i64 bit patterns, materialized as pointers only for
+; dereference - the same values C manipulates.
+;
+; READ_ONCE() sites use volatile loads (loadv); the
+; smp_wmb() calls in assoc_array_apply_edit use
+; fence.release, which is what smp_wmb amounts to on
+; x86_64 (a compiler barrier, no instruction).
+;
+; Allocations go to __kmalloc_noprof, the entry point the
+; kzalloc/kmalloc inlines reduce to for runtime sizes:
+; kzalloc sites pass GFP_KERNEL|__GFP_ZERO (0xDC0), the
+; one plain kmalloc site in assoc_array_gc passes
+; GFP_KERNEL (0xCC0).
+;
+; BUG_ON()/BUG() traps: where C asserts an invariant, the
+; Krell form calls panic() and does not return, preserving
+; the observable contract.
+;
+; The walk result: C passes a 48-byte stack struct to
+; assoc_array_walk; here the seven result fields travel
+; through seven separate 8-byte slots owned by the caller
+; (a contiguous multi-word stack buffer cannot be an
+; alloca here).  The delete collapse context (24 bytes,
+; passed by pointer to the collapse iterator) cannot
+; live in module data either (Krell data blobs are
+; constants, emitted in .rodata), so it is a small
+; kzalloc for the duration of the collapse walk, freed
+; before the edit is returned; its allocation failure
+; takes the same -ENOMEM path as the replacement node's.
+
+extern __kmalloc_noprof(i64, i64) -> ptr
+extern kfree(ptr) -> void
+extern memcpy(ptr, ptr, i64) -> ptr
+extern call_rcu(ptr, ptr) -> void
+extern panic(ptr) -> void
+
+sig kla_sig_chunk(ptr, i32) -> i64
+sig kla_sig_cmpobj(ptr, ptr) -> i32
+sig kla_sig_diff(ptr, ptr) -> i32
+sig kla_sig_free(ptr) -> void
+sig kla_sig_iter(ptr, ptr) -> i32
+sig kla_sig_gciter(ptr, ptr) -> i32
+
+fn kla_call_chunk(ptr, i64, ptr, i32) -> i64 {
+  entry(base: ptr, off: i64, a: ptr, level: i32):
+    %pp = gep i8 base, off
+    %fp = load ptr, %pp
+    %r = calli i64 kla_sig_chunk %fp(a, level)
+    ret %r
+}
+
+fn kla_call_cmpobj(ptr, i64, ptr, ptr) -> i32 {
+  entry(base: ptr, off: i64, obj: ptr, key: ptr):
+    %pp = gep i8 base, off
+    %fp = load ptr, %pp
+    %r = calli i32 kla_sig_cmpobj %fp(obj, key)
+    %b = trunc i8 %r
+    %n = zext i32 %b
+    ret %n
+}
+
+fn kla_call_diff(ptr, i64, ptr, ptr) -> i32 {
+  entry(base: ptr, off: i64, obj: ptr, key: ptr):
+    %pp = gep i8 base, off
+    %fp = load ptr, %pp
+    %r = calli i32 kla_sig_diff %fp(obj, key)
+    ret %r
+}
+
+fn kla_call_free(ptr, i64, ptr) -> void {
+  entry(base: ptr, off: i64, obj: ptr):
+    %pp = gep i8 base, off
+    %fp = load ptr, %pp
+    calli void kla_sig_free %fp(obj)
+    ret
+}
+
+fn kla_call_iter(ptr, ptr, ptr) -> i32 {
+  entry(slot: ptr, leaf: ptr, data: ptr):
+    %fp = load ptr, slot
+    %r = calli i32 kla_sig_iter %fp(leaf, data)
+    ret %r
+}
+
+fn kla_call_gciter(ptr, ptr, ptr) -> i32 {
+  entry(slot: ptr, leaf: ptr, data: ptr):
+    %fp = load ptr, slot
+    %r = calli i32 kla_sig_gciter %fp(leaf, data)
+    %b = trunc i8 %r
+    %n = zext i32 %b
+    ret %n
+}
+
+data kla_bugmsg: i8 = { 107, 114, 101, 108, 108, 105, 110, 117, 120, 58, 32, 97, 115, 115, 111, 99, 95, 97, 114, 114, 97, 121, 32, 105, 110, 118, 97, 114, 105, 97, 110, 116, 32, 118, 105, 111, 108, 97, 116, 101, 100, 10, 0 }
+
+fn kla_ptrval(ptr) -> i64 {
+  entry(p: ptr):
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    store ptr %slot, p
+    %v = load i64, %slot
+    ret %v
+}
+
+fn kla_fromval(i64) -> ptr {
+  entry(v: i64):
+    %slot = alloca 8, 8
+    store i64 %slot, v
+    %p = load ptr, %slot
+    ret %p
+}
+
+fn kla_null() -> ptr {
+  entry():
+    %p = call ptr kla_fromval(0)
+    ret %p
+}
+
+fn kla_bug() -> void {
+  entry():
+    %msg = dataptr 0
+    call void panic(%msg)
+    br hang()
+  hang():
+    br hang()
+}
+
+fn kla_kzalloc(i64) -> ptr {
+  entry(size: i64):
+    %p = call ptr __kmalloc_noprof(size, 3424)
+    ret %p
+}
+
+fn kla_subtree_iterate(i64, i64, ptr, ptr) -> i32 {
+  entry(root: i64, stop: i64, iter: ptr, data: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, iter
+    br begin_node(root, stop, %slot, data)
+  begin_node(cursor: i64, stop: i64, iter: ptr, data: ptr):
+    %sc = and i64 cursor, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, via_sc(cursor, stop, iter, data), to_node(cursor, stop, iter, data)
+  via_sc(cursor: i64, stop: i64, iter: ptr, data: ptr):
+    %base = and i64 cursor, -4
+    %sc = call ptr kla_fromval(%base)
+    %pp = gep i8 %sc, 16
+    %nn = loadv i64, %pp
+    br to_node(%nn, stop, iter, data)
+  to_node(cursor: i64, stop: i64, iter: ptr, data: ptr):
+    %base = and i64 cursor, -4
+    %node = call ptr kla_fromval(%base)
+    br pass1(cursor, stop, iter, data, %node, 0, 0)
+  pass1(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64, has_meta: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, p1_body(cursor, stop, iter, data, node, slot, has_meta), p1_done(cursor, stop, iter, data, node, has_meta)
+  p1_body(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64, has_meta: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = loadv i64, %pp
+    %hm = or i64 has_meta, %ptr
+    %nz = icmp.ne i64 %ptr, 0
+    condbr %nz, p1_chk(cursor, stop, iter, data, node, slot, %hm, %ptr), p1_next(cursor, stop, iter, data, node, slot, %hm)
+  p1_chk(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64, has_meta: i64, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, p1_call(cursor, stop, iter, data, node, slot, has_meta, ptr), p1_next(cursor, stop, iter, data, node, slot, has_meta)
+  p1_call(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64, has_meta: i64, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %ret = call i32 kla_call_iter(%iter, %leaf, data)
+    %nz = icmp.ne i32 %ret, 0
+    condbr %nz, retblk(%ret), p1_next(cursor, stop, iter, data, node, slot, has_meta)
+  p1_next(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64, has_meta: i64):
+    %s1 = add i64 slot, 1
+    br pass1(cursor, stop, iter, data, node, %s1, has_meta)
+  p1_done(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, has_meta: i64):
+    %m = and i64 has_meta, 1
+    %z = icmp.eq i64 %m, 0
+    condbr %z, finished(stop, iter, data, node), pass2(cursor, stop, iter, data, 0)
+  pass2(cursor: i64, stop: i64, iter: ptr, data: ptr, slot: i64):
+    %base = and i64 cursor, -4
+    %node = call ptr kla_fromval(%base)
+    br p2_loop(cursor, stop, iter, data, %node, slot)
+  p2_loop(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, p2_body(cursor, stop, iter, data, node, slot), finished(stop, iter, data, node)
+  p2_body(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = loadv i64, %pp
+    %meta = and i64 %ptr, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, begin_node(%ptr, stop, iter, data), p2_next(cursor, stop, iter, data, node, slot)
+  p2_next(cursor: i64, stop: i64, iter: ptr, data: ptr, node: ptr, slot: i64):
+    %s1 = add i64 slot, 1
+    br p2_loop(cursor, stop, iter, data, node, %s1)
+  finished(stop: i64, iter: ptr, data: ptr, node: ptr):
+    %parent = loadv i64, node
+    %sp = gep i8 node, 8
+    %slot8 = load i8, %sp
+    %slot = zext i64 %slot8
+    %eq = icmp.eq i64 %parent, stop
+    condbr %eq, retzero(), f_chk(%parent, %slot, stop, iter, data)
+  f_chk(parent: i64, slot: i64, stop: i64, iter: ptr, data: ptr):
+    %sc = and i64 parent, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, f_sc(parent, stop, iter, data), ascend(parent, slot, stop, iter, data)
+  f_sc(parent: i64, stop: i64, iter: ptr, data: ptr):
+    %base = and i64 parent, -4
+    %sc = call ptr kla_fromval(%base)
+    %bp = loadv i64, %sc
+    %sp = gep i8 %sc, 8
+    %slot32 = load i32, %sp
+    %slot = sext i64 %slot32
+    %eq = icmp.eq i64 %bp, stop
+    condbr %eq, retzero(), ascend(%bp, %slot, stop, iter, data)
+  ascend(parent: i64, slot: i64, stop: i64, iter: ptr, data: ptr):
+    %s1 = add i64 slot, 1
+    br pass2(parent, stop, iter, data, %s1)
+  retzero():
+    ret 0
+  retblk(r: i32):
+    ret r
+}
+
+fn assoc_array_iterate(ptr, ptr, ptr) -> i32 {
+  entry(array: ptr, iter: ptr, data: ptr):
+    %root = loadv i64, array
+    %z = icmp.eq i64 %root, 0
+    condbr %z, retzero(), go(%root, iter, data)
+  go(root: i64, iter: ptr, data: ptr):
+    %r = call i32 kla_subtree_iterate(root, 0, iter, data)
+    ret %r
+  retzero():
+    ret 0
+}
+
+fn kla_walk(ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr) -> i64 {
+  entry(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr):
+    %root = loadv i64, array
+    %fp = load ptr, ops
+    %z = icmp.eq i64 %root, 0
+    condbr %z, empty(), jumped(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, %root, 0, %fp)
+  jumped(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, level: i64, fp: ptr):
+    %lv32 = trunc i32 level
+    %segs = call i64 kla_call_chunk(ops, 0, key, %lv32)
+    %sc = and i64 cursor, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, follow_sc(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, level, %segs, fp), consider(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, level, %segs, fp)
+  consider(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, level: i64, segs: i64, fp: ptr):
+    %base = and i64 cursor, -4
+    %node = call ptr kla_fromval(%base)
+    %sh = and i64 level, 63
+    %seg = lshr i64 segs, %sh
+    %slot = and i64 %seg, 15
+    %off = mul i64 %slot, 8
+    %addr = gep i8 %node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = loadv i64, %pp
+    %meta = and i64 %ptr, 1
+    %z = icmp.eq i64 %meta, 0
+    condbr %z, terminal(onode, olevel, oslot, %node, level, %slot), meta(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, level, segs, %ptr, fp)
+  terminal(onode: ptr, olevel: ptr, oslot: ptr, node: ptr, level: i64, slot: i64):
+    store ptr %onode, node
+    store i64 %olevel, level
+    store i64 %oslot, slot
+    ret 1
+  meta(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, level: i64, segs: i64, ptr: i64, fp: ptr):
+    %isnode = and i64 ptr, 2
+    %z = icmp.eq i64 %isnode, 0
+    condbr %z, downnode(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, level, segs, ptr, fp), follow_sc(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, ptr, level, segs, fp)
+  downnode(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, level: i64, segs: i64, ptr: i64, fp: ptr):
+    %l1 = add i64 level, 4
+    %cm = and i64 %l1, 63
+    %nz = icmp.ne i64 %cm, 0
+    condbr %nz, consider(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, ptr, %l1, segs, fp), jumped(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, ptr, %l1, fp)
+  follow_sc(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, level: i64, segs: i64, fp: ptr):
+    %base = and i64 cursor, -4
+    %sc = call ptr kla_fromval(%base)
+    %spp = gep i8 %sc, 12
+    %skip32 = load i32, %spp
+    %skip = sext i64 %skip32
+    %sclevel = add i64 level, 4
+    %gt = icmp.sgt i64 %sclevel, %skip
+    condbr %gt, bug(), sc_loop(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, %sc, %skip, level, %sclevel, segs, fp)
+  sc_loop(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, sclevel: i64, segs: i64, fp: ptr):
+    %cm = and i64 sclevel, 63
+    %z = icmp.eq i64 %cm, 0
+    condbr %z, refetch(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, fp), have(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, segs, fp)
+  refetch(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, sclevel: i64, fp: ptr):
+    %lv32 = trunc i32 sclevel
+    %segs = call i64 kla_call_chunk(ops, 0, key, %lv32)
+    br have(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, %segs, fp)
+  have(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, sclevel: i64, segs: i64, fp: ptr):
+    %idx = lshr i64 sclevel, 6
+    %off = mul i64 %idx, 8
+    %addr = gep i8 sc, %off
+    %pp = gep i8 %addr, 24
+    %scsegs = load i64, %pp
+    %diss = xor i64 segs, %scsegs
+    %rd = and i64 sclevel, -64
+    %lim = add i64 %rd, 64
+    %lt = icmp.slt i64 skip, %lim
+    condbr %lt, trim(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, segs, %scsegs, %diss, fp), notrim(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, segs, %scsegs, %diss, fp)
+  trim(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, sclevel: i64, segs: i64, scsegs: i64, diss: i64, fp: ptr):
+    %shift = and i64 skip, 63
+    %pow = shl i64 1, %shift
+    %keep = sub i64 %pow, 1
+    %diss2 = and i64 diss, %keep
+    br sc_chk(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, segs, scsegs, %diss2, skip, fp)
+  notrim(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, sclevel: i64, segs: i64, scsegs: i64, diss: i64, fp: ptr):
+    %n1 = add i64 sclevel, 64
+    %next = and i64 %n1, -64
+    br sc_chk(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, segs, scsegs, diss, %next, fp)
+  sc_chk(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, sclevel: i64, segs: i64, scsegs: i64, diss: i64, next: i64, fp: ptr):
+    %nz = icmp.ne i64 diss, 0
+    condbr %nz, wrong(osc, olevel, osclevel, oscseg, odiss, sc, level, sclevel, scsegs, diss), sc_next(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, segs, next, fp)
+  wrong(osc: ptr, olevel: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, sc: ptr, level: i64, sclevel: i64, scsegs: i64, diss: i64):
+    store ptr %osc, sc
+    store i64 %olevel, level
+    store i64 %osclevel, sclevel
+    store i64 %oscseg, scsegs
+    store i64 %odiss, diss
+    ret 2
+  sc_next(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, cursor: i64, sc: ptr, skip: i64, level: i64, segs: i64, sclevel: i64, fp: ptr):
+    %lt = icmp.slt i64 sclevel, skip
+    condbr %lt, sc_loop(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, cursor, sc, skip, level, sclevel, segs, fp), sc_done(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, sc, level, segs, sclevel, fp)
+  sc_done(array: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr, sc: ptr, level: i64, segs: i64, sclevel: i64, fp: ptr):
+    %pp = gep i8 sc, 16
+    %nn = loadv i64, %pp
+    %x = xor i64 level, sclevel
+    %mask = and i64 %x, -64
+    %nz = icmp.ne i64 %mask, 0
+    condbr %nz, jumped(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, %nn, sclevel, fp), consider(array, ops, key, onode, olevel, oslot, osc, osclevel, oscseg, odiss, %nn, sclevel, segs, fp)
+  empty():
+    ret 0
+  bug():
+    call void kla_bug()
+    ret 0
+}
+
+fn assoc_array_find(ptr, ptr, ptr) -> ptr {
+  entry(array: ptr, ops: ptr, key: ptr):
+    %onode = alloca 8, 8
+    %olevel = alloca 8, 8
+    %oslot = alloca 8, 8
+    %osc = alloca 8, 8
+    %osclevel = alloca 8, 8
+    %oscseg = alloca 8, 8
+    %odiss = alloca 8, 8
+    %st = call i64 kla_walk(array, ops, key, %onode, %olevel, %oslot, %osc, %osclevel, %oscseg, %odiss)
+    %eq = icmp.eq i64 %st, 1
+    condbr %eq, scan(ops, key, %onode, 0), nullret()
+  scan(ops: ptr, key: ptr, onode: ptr, slot: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, body(ops, key, onode, slot), nullret()
+  body(ops: ptr, key: ptr, onode: ptr, slot: i64):
+    %node = load ptr, %onode
+    %off = mul i64 slot, 8
+    %addr = gep i8 %node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = loadv i64, %pp
+    %nz = icmp.ne i64 %ptr, 0
+    condbr %nz, chk(ops, key, onode, slot, %ptr), next(ops, key, onode, slot)
+  chk(ops: ptr, key: ptr, onode: ptr, slot: i64, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, cmp(ops, key, onode, slot, ptr), next(ops, key, onode, slot)
+  cmp(ops: ptr, key: ptr, onode: ptr, slot: i64, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %r = call i32 kla_call_cmpobj(ops, 16, %leaf, key)
+    %nz = icmp.ne i32 %r, 0
+    condbr %nz, found(%leaf), next(ops, key, onode, slot)
+  next(ops: ptr, key: ptr, onode: ptr, slot: i64):
+    %s1 = add i64 slot, 1
+    br scan(ops, key, onode, %s1)
+  found(leaf: ptr):
+    ret leaf
+  nullret():
+    %null = call ptr kla_null()
+    ret %null
+}
+
+fn kla_destroy_subtree(i64, ptr) -> void {
+  entry(root: i64, ops: ptr):
+    %z = icmp.eq i64 root, 0
+    condbr %z, done(), start(root, ops)
+  start(root: i64, ops: ptr):
+    br move_to_meta(root, 0, -1, ops)
+  move_to_meta(cursor: i64, parent: i64, slot: i64, ops: ptr):
+    %sc = and i64 cursor, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, sc_down(cursor, parent, slot, ops), node_chk(cursor, parent, slot, ops)
+  sc_down(cursor: i64, parent: i64, slot: i64, ops: ptr):
+    %base = and i64 cursor, -4
+    %sc = call ptr kla_fromval(%base)
+    %bp = load i64, %sc
+    %ne = icmp.ne i64 %bp, parent
+    condbr %ne, bug(), sc_chk2(cursor, %sc, slot, ops)
+  sc_chk2(cursor: i64, sc: ptr, slot: i64, ops: ptr):
+    %m1 = icmp.eq i64 slot, -1
+    condbr %m1, sc_go(cursor, sc, ops), sc_chk3(cursor, sc, slot, ops)
+  sc_chk3(cursor: i64, sc: ptr, slot: i64, ops: ptr):
+    %pp = gep i8 sc, 8
+    %ps = load i32, %pp
+    %ps64 = sext i64 %ps
+    %ne = icmp.ne i64 %ps64, slot
+    condbr %ne, bug(), sc_go(cursor, sc, ops)
+  sc_go(cursor: i64, sc: ptr, ops: ptr):
+    %pp = gep i8 sc, 16
+    %nn = load i64, %pp
+    %isnode = and i64 %nn, 2
+    %nz = icmp.ne i64 %isnode, 0
+    condbr %nz, bug(), node_chk(%nn, cursor, -1, ops)
+  node_chk(cursor: i64, parent: i64, slot: i64, ops: ptr):
+    %base = and i64 cursor, -4
+    %node = call ptr kla_fromval(%base)
+    %bp = load i64, %node
+    %ne = icmp.ne i64 %bp, parent
+    condbr %ne, bug(), n_chk2(cursor, parent, slot, ops, %node)
+  n_chk2(cursor: i64, parent: i64, slot: i64, ops: ptr, node: ptr):
+    %m1 = icmp.eq i64 slot, -1
+    condbr %m1, n_go(cursor, parent, node, ops), n_chk3(cursor, parent, slot, ops, node)
+  n_chk3(cursor: i64, parent: i64, slot: i64, ops: ptr, node: ptr):
+    %pp = gep i8 node, 8
+    %ps = load i8, %pp
+    %ps64 = zext i64 %ps
+    %ne = icmp.ne i64 %ps64, slot
+    condbr %ne, bug(), n_go(cursor, parent, node, ops)
+  n_go(cursor: i64, parent: i64, node: ptr, ops: ptr):
+    br continue_node(cursor, parent, node, 0, ops)
+  continue_node(cursor: i64, parent: i64, node: ptr, slot: i64, ops: ptr):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, body(cursor, parent, node, slot, ops), ascend_prep(cursor, node, ops)
+  body(cursor: i64, parent: i64, node: ptr, slot: i64, ops: ptr):
+    %off = mul i64 slot, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %z = icmp.eq i64 %ptr, 0
+    condbr %z, next(cursor, parent, node, slot, ops), chkmeta(cursor, parent, node, slot, ops, %ptr)
+  chkmeta(cursor: i64, parent: i64, node: ptr, slot: i64, ops: ptr, ptr: i64):
+    %meta = and i64 ptr, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, move_to_meta(ptr, cursor, slot, ops), freechk(cursor, parent, node, slot, ops, ptr)
+  freechk(cursor: i64, parent: i64, node: ptr, slot: i64, ops: ptr, ptr: i64):
+    %ov = call i64 kla_ptrval(ops)
+    %nz = icmp.ne i64 %ov, 0
+    condbr %nz, freeleaf(cursor, parent, node, slot, ops, ptr), next(cursor, parent, node, slot, ops)
+  freeleaf(cursor: i64, parent: i64, node: ptr, slot: i64, ops: ptr, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    call void kla_call_free(ops, 32, %leaf)
+    br next(cursor, parent, node, slot, ops)
+  next(cursor: i64, parent: i64, node: ptr, slot: i64, ops: ptr):
+    %s1 = add i64 slot, 1
+    br continue_node(cursor, parent, node, %s1, ops)
+  ascend_prep(cursor: i64, node: ptr, ops: ptr):
+    %par = load i64, node
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %slot = zext i64 %ps
+    call void kfree(node)
+    %z = icmp.eq i64 %par, 0
+    condbr %z, done(), ascend(%par, %slot, cursor, ops)
+  ascend(parent: i64, slot: i64, cursor: i64, ops: ptr):
+    %sc = and i64 parent, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, sc_up(parent, slot, cursor, ops), up_node(parent, slot, ops)
+  sc_up(parent: i64, slot: i64, cursor: i64, ops: ptr):
+    %base = and i64 parent, -4
+    %sc = call ptr kla_fromval(%base)
+    %pp = gep i8 %sc, 16
+    %nn = load i64, %pp
+    %ne = icmp.ne i64 %nn, cursor
+    condbr %ne, bug(), sc_up2(parent, %sc, ops)
+  sc_up2(parent: i64, sc: ptr, ops: ptr):
+    %bp = load i64, %sc
+    %sp = gep i8 %sc, 8
+    %ps = load i32, %sp
+    %slot = sext i64 %ps
+    call void kfree(%sc)
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, done(), sc_up3(%bp, %slot, ops)
+  sc_up3(bp: i64, slot: i64, ops: ptr):
+    %isnode = and i64 bp, 2
+    %nz = icmp.ne i64 %isnode, 0
+    condbr %nz, bug(), up_node(bp, slot, ops)
+  up_node(parent: i64, slot: i64, ops: ptr):
+    %base = and i64 parent, -4
+    %node = call ptr kla_fromval(%base)
+    %s1 = add i64 slot, 1
+    br continue_node(parent, parent, %node, %s1, ops)
+  bug():
+    call void kla_bug()
+    br done()
+  done():
+    ret
+}
+
+fn assoc_array_destroy(ptr, ptr) -> void {
+  entry(array: ptr, ops: ptr):
+    %root = load i64, array
+    call void kla_destroy_subtree(%root, ops)
+    %null = call ptr kla_null()
+    store ptr %array, %null
+    ret
+}
+
+; edit field stores: edit is a real pointer; offsets per
+; the layout table in the header comment.
+fn kla_edit_st(ptr, i64, i64) -> void {
+  entry(edit: ptr, off: i64, val: i64):
+    %p = gep i8 edit, off
+    store i64 %p, val
+    ret
+}
+
+fn kla_edit_ld(ptr, i64) -> i64 {
+  entry(edit: ptr, off: i64):
+    %p = gep i8 edit, off
+    %v = load i64, %p
+    ret %v
+}
+
+fn kla_seg_st(ptr, i64, i64) -> void {
+  entry(edit: ptr, idx: i64, val: i64):
+    %off = add i64 304, idx
+    %p = gep i8 edit, %off
+    %v = trunc i8 val
+    store i8 %p, %v
+    ret
+}
+
+fn kla_seg_ld(ptr, i64) -> i64 {
+  entry(edit: ptr, idx: i64):
+    %off = add i64 304, idx
+    %p = gep i8 edit, %off
+    %v = load i8, %p
+    %r = zext i64 %v
+    ret %r
+}
+
+fn kla_insert_in_empty_tree(ptr) -> i64 {
+  entry(edit: ptr):
+    %n0 = call ptr kla_kzalloc(152)
+    %nv = call i64 kla_ptrval(%n0)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, fail(), go(edit, %n0, %nv)
+  go(edit: ptr, n0: ptr, n0v: i64):
+    %tagged = or i64 n0v, 1
+    call void kla_edit_st(edit, 64, %tagged)
+    %leafp = gep i8 n0, 16
+    %lv = call i64 kla_ptrval(%leafp)
+    call void kla_edit_st(edit, 48, %lv)
+    call void kla_edit_st(edit, 240, n0v)
+    %arr = call i64 kla_edit_ld(edit, 16)
+    call void kla_edit_st(edit, 256, %arr)
+    call void kla_edit_st(edit, 264, %tagged)
+    ret 1
+  fail():
+    ret 0
+}
+
+; The shared node-split tail of
+; assoc_array_insert_into_terminal_node.  On entry the
+; segment cache in the edit describes the old node's
+; leaves (and the new leaf at index 16), new_meta[0] and
+; new_meta[1] hold n0/n1, and set[0].to is already set.
+fn kla_do_split(ptr, ptr, ptr, ptr, ptr) -> void {
+  entry(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr):
+    %nrp = gep i8 node, 144
+    %nrv = load i64, %nrp
+    %t0 = gep i8 n0, 144
+    store i64 %t0, %nrv
+    %t1 = gep i8 n1, 144
+    store i64 %t1, 0
+    br find_i(edit, ops, node, n0, n1, 0)
+  find_i(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, fi_body(edit, ops, node, n0, n1, i), found(edit, ops, node, n0, n1, i, 17, 255)
+  fi_body(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %s = call i64 kla_seg_ld(edit, i)
+    %ff = icmp.eq i64 %s, 255
+    condbr %ff, fi_next(edit, ops, node, n0, n1, i), find_j(edit, ops, node, n0, n1, i, %s)
+  fi_next(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br find_i(edit, ops, node, n0, n1, %i1)
+  find_j(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, s: i64):
+    %j0 = add i64 i, 1
+    br fj_loop(edit, ops, node, n0, n1, i, s, %j0)
+  fj_loop(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, s: i64, j: i64):
+    %lt = icmp.slt i64 j, 17
+    condbr %lt, fj_body(edit, ops, node, n0, n1, i, s, j), fi_next(edit, ops, node, n0, n1, i)
+  fj_body(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, s: i64, j: i64):
+    %sj = call i64 kla_seg_ld(edit, j)
+    %eq = icmp.eq i64 %sj, s
+    condbr %eq, found(edit, ops, node, n0, n1, i, j, s), fj_next(edit, ops, node, n0, n1, i, s, j)
+  fj_next(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, s: i64, j: i64):
+    %j1 = add i64 j, 1
+    br fj_loop(edit, ops, node, n0, n1, i, s, %j1)
+  found(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, j: i64, slot: i64):
+    %bi = icmp.sge i64 i, 16
+    condbr %bi, bug(), found2(edit, ops, node, n0, n1, i, j, slot)
+  found2(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, j: i64, slot: i64):
+    %bj = icmp.sge i64 j, 17
+    condbr %bj, bug(), found3(edit, ops, node, n0, n1, slot)
+  found3(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64):
+    %bs = icmp.sge i64 slot, 16
+    condbr %bs, bug(), setup(edit, ops, node, n0, n1, slot)
+  setup(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64):
+    %sp = gep i8 n1, 8
+    %sv = trunc i8 slot
+    store i8 %sp, %sv
+    br copyloop(edit, ops, node, n0, n1, slot, 0)
+  copyloop(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, copybody(edit, ops, node, n0, n1, slot, i), filter(edit, ops, node, n0, n1, slot)
+  copybody(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %meta = and i64 %ptr, 1
+    %dst = gep i8 n0, %off
+    %dp = gep i8 %dst, 16
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, copymeta(edit, ops, node, n0, n1, slot, i, %dp, %ptr), copyzero(edit, ops, node, n0, n1, slot, i, %dp)
+  copymeta(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, dp: ptr, ptr: i64):
+    store i64 %dp, ptr
+    br copynext(edit, ops, node, n0, n1, slot, i)
+  copyzero(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, dp: ptr):
+    store i64 %dp, 0
+    br copynext(edit, ops, node, n0, n1, slot, i)
+  copynext(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64):
+    %i1 = add i64 i, 1
+    br copyloop(edit, ops, node, n0, n1, slot, %i1)
+  filter(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    %chk = load i64, %pp
+    %nz = icmp.ne i64 %chk, 0
+    condbr %nz, bug(), finstall(edit, ops, node, n0, n1, slot)
+  finstall(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64):
+    %n1v = call i64 kla_ptrval(n1)
+    %tag = or i64 %n1v, 1
+    %off = mul i64 slot, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, %tag
+    br floop(edit, ops, node, n0, n1, slot, 0, -1, 0)
+  floop(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, fbody(edit, ops, node, n0, n1, slot, i, free_slot, next_slot), fdone(edit, ops, node, n0, n1, slot, free_slot, next_slot)
+  fbody(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %meta = and i64 %ptr, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, fnext(edit, ops, node, n0, n1, slot, i, free_slot, next_slot), fchk(edit, ops, node, n0, n1, slot, i, free_slot, next_slot, %ptr)
+  fchk(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64, ptr: i64):
+    %s = call i64 kla_seg_ld(edit, i)
+    %eq = icmp.eq i64 %s, slot
+    condbr %eq, fton1(edit, ops, node, n0, n1, slot, i, free_slot, next_slot, ptr), fton0(edit, ops, node, n0, n1, slot, i, free_slot, next_slot, ptr)
+  fton1(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64, ptr: i64):
+    %off = mul i64 next_slot, 8
+    %addr = gep i8 n1, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, ptr
+    %np = gep i8 n1, 144
+    %nr = load i64, %np
+    %nr1 = add i64 %nr, 1
+    store i64 %np, %nr1
+    %ns1 = add i64 next_slot, 1
+    br fnext(edit, ops, node, n0, n1, slot, i, free_slot, %ns1)
+  fton0(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64, ptr: i64):
+    br fscan0(edit, ops, node, n0, n1, slot, i, free_slot, next_slot, ptr, free_slot)
+  fscan0(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64, ptr: i64, cand: i64):
+    %c1 = add i64 cand, 1
+    %off = mul i64 %c1, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    %v = load i64, %pp
+    %z = icmp.eq i64 %v, 0
+    condbr %z, fput0(edit, ops, node, n0, n1, slot, i, %c1, next_slot, ptr), fscan0(edit, ops, node, n0, n1, slot, i, free_slot, next_slot, ptr, %c1)
+  fput0(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64, ptr: i64):
+    %off = mul i64 free_slot, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, ptr
+    br fnext(edit, ops, node, n0, n1, slot, i, free_slot, next_slot)
+  fnext(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, i: i64, free_slot: i64, next_slot: i64):
+    %i1 = add i64 i, 1
+    br floop(edit, ops, node, n0, n1, slot, %i1, free_slot, next_slot)
+  fdone(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, free_slot: i64, next_slot: i64):
+    %s16 = call i64 kla_seg_ld(edit, 16)
+    %eq = icmp.eq i64 %s16, slot
+    condbr %eq, leafn1(edit, ops, node, n0, n1, slot, free_slot, next_slot), leafn0(edit, ops, node, n0, n1, slot, free_slot, next_slot)
+  leafn0(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, free_slot: i64, next_slot: i64):
+    br lscan0(edit, ops, node, n0, n1, slot, free_slot, next_slot, free_slot)
+  lscan0(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, free_slot: i64, next_slot: i64, cand: i64):
+    %c1 = add i64 cand, 1
+    %off = mul i64 %c1, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    %v = load i64, %pp
+    %z = icmp.eq i64 %v, 0
+    condbr %z, lput0(edit, n0, next_slot, %c1), lscan0(edit, ops, node, n0, n1, slot, free_slot, next_slot, %c1)
+  lput0(edit: ptr, n0: ptr, next_slot: i64, free_slot: i64):
+    %off = mul i64 free_slot, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 48, %av)
+    %n0v = call i64 kla_ptrval(n0)
+    call void kla_edit_st(edit, 240, %n0v)
+    br tailchk(edit, ops, node, n0, n1, next_slot)
+  leafn1(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, slot: i64, free_slot: i64, next_slot: i64):
+    %off = mul i64 next_slot, 8
+    %addr = gep i8 n1, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 48, %av)
+    %n1v = call i64 kla_ptrval(n1)
+    call void kla_edit_st(edit, 240, %n1v)
+    %ns1 = add i64 next_slot, 1
+    br tailchk(edit, ops, node, n0, n1, %ns1)
+  tailchk(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, next_slot: i64):
+    %le = icmp.sle i64 next_slot, 1
+    condbr %le, bug(), backptrs(edit, ops, node, n0, n1)
+  backptrs(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr):
+    %n0v = call i64 kla_ptrval(n0)
+    %tag = or i64 %n0v, 1
+    call void kla_edit_st(edit, 232, %tag)
+    br bploop(edit, ops, node, n0, n1, 0)
+  bploop(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, bpbody(edit, ops, node, n0, n1, i), setptr(edit, node)
+  bpbody(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %s = call i64 kla_seg_ld(edit, i)
+    %ff = icmp.eq i64 %s, 255
+    condbr %ff, bpwork(edit, ops, node, n0, n1, i), bpnext(edit, ops, node, n0, n1, i)
+  bpwork(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %leaf = and i64 %ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, bug(), bpaddr(edit, ops, node, n0, n1, i, %ptr)
+  bpaddr(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, ptr: i64):
+    %base = and i64 ptr, -4
+    %obj = call ptr kla_fromval(%base)
+    %av = call i64 kla_ptrval(%obj)
+    br bpstore(edit, ops, node, n0, n1, i, %av)
+  bpstore(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64, av: i64):
+    %off = mul i64 i, 8
+    %eoff = add i64 104, %off
+    call void kla_edit_st(edit, %eoff, av)
+    br bpnext(edit, ops, node, n0, n1, i)
+  bpnext(edit: ptr, ops: ptr, node: ptr, n0: ptr, n1: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br bploop(edit, ops, node, n0, n1, %i1)
+  setptr(edit: ptr, node: ptr):
+    %bp = load i64, node
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, setroot(edit), setchk(edit, node, %bp)
+  setroot(edit: ptr):
+    %arr = call i64 kla_edit_ld(edit, 16)
+    call void kla_edit_st(edit, 256, %arr)
+    br fin(edit, node)
+  setchk(edit: ptr, node: ptr, bp: i64):
+    %nd = and i64 bp, 2
+    %z = icmp.eq i64 %nd, 0
+    condbr %z, setnode(edit, node, bp), setsc(edit, node, bp)
+  setnode(edit: ptr, node: ptr, bp: i64):
+    %base = and i64 bp, -4
+    %par = call ptr kla_fromval(%base)
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %ps64 = zext i64 %ps
+    %off = mul i64 %ps64, 8
+    %addr = gep i8 %par, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 256, %av)
+    br fin(edit, node)
+  setsc(edit: ptr, node: ptr, bp: i64):
+    %base = and i64 bp, -4
+    %sc = call ptr kla_fromval(%base)
+    %pp = gep i8 %sc, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 256, %av)
+    br fin(edit, node)
+  fin(edit: ptr, node: ptr):
+    %nv = call i64 kla_ptrval(node)
+    %tag = or i64 %nv, 1
+    call void kla_edit_st(edit, 88, %tag)
+    ret
+  bug():
+    call void kla_bug()
+    ret
+}
+
+fn kla_insert_terminal(ptr, ptr, ptr, ptr, i64, i64) -> i64 {
+  entry(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, tslot: i64):
+    call void kla_seg_st(edit, 16, tslot)
+    br scan(edit, ops, key, node, level, 0, -1)
+  scan(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, i: i64, free_slot: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, sbody(edit, ops, key, node, level, i, free_slot), scanned(edit, ops, key, node, level, free_slot)
+  sbody(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, i: i64, free_slot: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %z = icmp.eq i64 %ptr, 0
+    condbr %z, markfree(edit, ops, key, node, level, i), schk(edit, ops, key, node, level, i, free_slot, %ptr)
+  markfree(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, i: i64):
+    %i1 = add i64 i, 1
+    br scan(edit, ops, key, node, level, %i1, i)
+  schk(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, i: i64, free_slot: i64, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, scmp(edit, ops, key, node, level, i, free_slot, ptr), snext(edit, ops, key, node, level, i, free_slot)
+  scmp(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, i: i64, free_slot: i64, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %r = call i32 kla_call_cmpobj(ops, 16, %leaf, key)
+    %nz = icmp.ne i32 %r, 0
+    condbr %nz, replace(edit, node, i, ptr), snext(edit, ops, key, node, level, i, free_slot)
+  replace(edit: ptr, node: ptr, i: i64, ptr: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 48, %av)
+    call void kla_edit_st(edit, 56, ptr)
+    ret 1
+  snext(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, i: i64, free_slot: i64):
+    %i1 = add i64 i, 1
+    br scan(edit, ops, key, node, level, %i1, free_slot)
+  scanned(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, free_slot: i64):
+    %ge = icmp.sge i64 free_slot, 0
+    condbr %ge, usefree(edit, node, free_slot), alloc(edit, ops, key, node, level)
+  usefree(edit: ptr, node: ptr, free_slot: i64):
+    %off = mul i64 free_slot, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 48, %av)
+    %nv = call i64 kla_ptrval(node)
+    call void kla_edit_st(edit, 240, %nv)
+    ret 1
+  alloc(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64):
+    %n0 = call ptr kla_kzalloc(152)
+    %n0v = call i64 kla_ptrval(%n0)
+    %z = icmp.eq i64 %n0v, 0
+    condbr %z, fail(), alloc2(edit, ops, key, node, level, %n0, %n0v)
+  alloc2(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n0v: i64):
+    %tag = or i64 n0v, 1
+    call void kla_edit_st(edit, 64, %tag)
+    %n1 = call ptr kla_kzalloc(152)
+    %n1v = call i64 kla_ptrval(%n1)
+    %z = icmp.eq i64 %n1v, 0
+    condbr %z, fail(), alloc3(edit, ops, key, node, level, %n0, %n1, %n1v)
+  alloc3(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, n1v: i64):
+    %tag1 = or i64 n1v, 1
+    call void kla_edit_st(edit, 72, %tag1)
+    br cachefill(edit, ops, key, node, level, n0, n1)
+  cachefill(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr):
+    br cf_loop(edit, ops, key, node, level, n0, n1, 0, 0)
+  cf_loop(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, have_meta: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, cf_body(edit, ops, key, node, level, n0, n1, i, have_meta), cf_done(edit, ops, key, node, level, n0, n1, have_meta)
+  cf_body(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, have_meta: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %meta = and i64 %ptr, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, cf_meta(edit, ops, key, node, level, n0, n1, i), cf_leaf(edit, ops, key, node, level, n0, n1, i, have_meta, %ptr)
+  cf_meta(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64):
+    call void kla_seg_st(edit, i, 255)
+    %i1 = add i64 i, 1
+    br cf_loop(edit, ops, key, node, level, n0, n1, %i1, 1)
+  cf_leaf(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, have_meta: i64, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %lv32 = trunc i32 level
+    %seg = call i64 kla_call_chunk(ops, 8, %leaf, %lv32)
+    %sh = and i64 level, 63
+    %seg2 = lshr i64 %seg, %sh
+    %val = and i64 %seg2, 15
+    call void kla_seg_st(edit, i, %val)
+    %i1 = add i64 i, 1
+    br cf_loop(edit, ops, key, node, level, n0, n1, %i1, have_meta)
+  cf_done(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, have_meta: i64):
+    %nz = icmp.ne i64 have_meta, 0
+    condbr %nz, split(edit, ops, key, node, n0, n1), diss(edit, ops, key, node, level, n0, n1)
+  diss(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr):
+    %base = call i64 kla_seg_ld(edit, 0)
+    br diss_loop(edit, ops, key, node, level, n0, n1, 1, 0, %base)
+  diss_loop(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, d: i64, base: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, diss_body(edit, ops, key, node, level, n0, n1, i, d, base), diss_done(edit, ops, key, node, level, n0, n1, d, base)
+  diss_body(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, d: i64, base: i64):
+    %s = call i64 kla_seg_ld(edit, i)
+    %x = xor i64 %s, base
+    %d2 = or i64 d, %x
+    %i1 = add i64 i, 1
+    br diss_loop(edit, ops, key, node, level, n0, n1, %i1, %d2, base)
+  diss_done(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, d: i64, base: i64):
+    %m = and i64 d, 15
+    %z = icmp.eq i64 %m, 0
+    condbr %z, clusterchk(edit, ops, key, node, level, n0, n1, base), split(edit, ops, key, node, n0, n1)
+  clusterchk(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, base: i64):
+    %s16 = call i64 kla_seg_ld(edit, 16)
+    %x = xor i64 %s16, base
+    %z = icmp.eq i64 %x, 0
+    condbr %z, cluster(edit, ops, key, node, level, n0, n1), split(edit, ops, key, node, n0, n1)
+  split(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr):
+    %n0v = call i64 kla_ptrval(n0)
+    %tag = or i64 %n0v, 1
+    call void kla_edit_st(edit, 264, %tag)
+    %bp = load i64, node
+    store i64 %n0, %bp
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %tp = gep i8 n0, 8
+    store i8 %tp, %ps
+    %n0t = or i64 %n0v, 1
+    store i64 %n1, %n0t
+    %tp1 = gep i8 n1, 8
+    store i8 %tp1, -1
+    call void kla_do_split(edit, ops, node, n0, n1)
+    ret 1
+  cluster(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr):
+    br diff_loop(edit, ops, key, node, level, n0, n1, 0, 2147483647)
+  diff_loop(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, diff: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, diff_body(edit, ops, key, node, level, n0, n1, i, diff), diff_done(edit, ops, key, node, level, n0, n1, diff)
+  diff_body(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, diff: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %base = and i64 %ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %x = call i32 kla_call_diff(ops, 24, %leaf, key)
+    %x64 = sext i64 %x
+    %lt = icmp.slt i64 %x64, diff
+    condbr %lt, diff_new(edit, ops, key, node, level, n0, n1, i, %x64), diff_next(edit, ops, key, node, level, n0, n1, i, diff)
+  diff_new(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, x: i64):
+    %neg = icmp.slt i64 x, 0
+    condbr %neg, bug(), diff_next(edit, ops, key, node, level, n0, n1, i, x)
+  diff_next(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, i: i64, diff: i64):
+    %i1 = add i64 i, 1
+    br diff_loop(edit, ops, key, node, level, n0, n1, %i1, diff)
+  diff_done(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, diff: i64):
+    %max = icmp.eq i64 diff, 2147483647
+    condbr %max, bug(), diff_chk(edit, ops, key, node, level, n0, n1, diff)
+  diff_chk(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, diff: i64):
+    %lim = add i64 level, 4
+    %lt = icmp.slt i64 diff, %lim
+    condbr %lt, bug(), salloc(edit, ops, key, node, level, n0, n1, diff)
+  salloc(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, diff: i64):
+    %ru = add i64 diff, 63
+    %ru2 = and i64 %ru, -64
+    %keylen = lshr i64 %ru2, 6
+    %bytes = mul i64 %keylen, 8
+    %size = add i64 %bytes, 24
+    %s0 = call ptr kla_kzalloc(%size)
+    %s0v = call i64 kla_ptrval(%s0)
+    %z = icmp.eq i64 %s0v, 0
+    condbr %z, fail(), ssetup(edit, ops, key, node, level, n0, n1, diff, %keylen, %s0, %s0v)
+  ssetup(edit: ptr, ops: ptr, key: ptr, node: ptr, level: i64, n0: ptr, n1: ptr, diff: i64, keylen: i64, s0: ptr, s0v: i64):
+    %tag = or i64 s0v, 3
+    call void kla_edit_st(edit, 80, %tag)
+    call void kla_edit_st(edit, 264, %tag)
+    %bp = load i64, node
+    store i64 %s0, %bp
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %ps32 = zext i32 %ps
+    %tp = gep i8 %s0, 8
+    store i32 %tp, %ps32
+    %n0v = call i64 kla_ptrval(n0)
+    %n0t = or i64 %n0v, 1
+    %np = gep i8 %s0, 16
+    store i64 %np, %n0t
+    store i64 %n0, %tag
+    %tp0 = gep i8 n0, 8
+    store i8 %tp0, 0
+    store i64 %n1, %n0t
+    %tp1 = gep i8 n1, 8
+    store i8 %tp1, -1
+    %newlevel = and i64 diff, -4
+    %kp = gep i8 %s0, 12
+    %nl32 = trunc i32 %newlevel
+    store i32 %kp, %nl32
+    %pos = icmp.sle i64 %newlevel, 0
+    condbr %pos, bug(), keyfill(edit, ops, key, node, n0, n1, %keylen, %s0, %newlevel)
+  keyfill(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, keylen: i64, s0: ptr, newlevel: i64):
+    br kf_loop(edit, ops, key, node, n0, n1, keylen, s0, newlevel, 0)
+  kf_loop(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, keylen: i64, s0: ptr, newlevel: i64, i: i64):
+    %lt = icmp.slt i64 i, keylen
+    condbr %lt, kf_body(edit, ops, key, node, n0, n1, keylen, s0, newlevel, i), kf_done(edit, ops, key, node, n0, n1, keylen, s0, newlevel)
+  kf_body(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, keylen: i64, s0: ptr, newlevel: i64, i: i64):
+    %lv = mul i64 i, 64
+    %lv32 = trunc i32 %lv
+    %chunk = call i64 kla_call_chunk(ops, 0, key, %lv32)
+    %off = mul i64 i, 8
+    %addr = gep i8 %s0, %off
+    %pp = gep i8 %addr, 24
+    store i64 %pp, %chunk
+    %i1 = add i64 i, 1
+    br kf_loop(edit, ops, key, node, n0, n1, keylen, s0, newlevel, %i1)
+  kf_done(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, keylen: i64, s0: ptr, newlevel: i64):
+    %cm = and i64 newlevel, 63
+    %nz = icmp.ne i64 %cm, 0
+    condbr %nz, blank(edit, ops, key, node, n0, n1, keylen, s0, newlevel), regen(edit, ops, key, node, n0, n1, newlevel)
+  blank(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, keylen: i64, s0: ptr, newlevel: i64):
+    %cm = and i64 newlevel, 63
+    %blank = shl i64 -1, %cm
+    br blank2(edit, ops, key, node, n0, n1, keylen, s0, newlevel, %blank)
+  blank2(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, keylen: i64, s0: ptr, newlevel: i64, blank: i64):
+    %last = sub i64 keylen, 1
+    %off = mul i64 %last, 8
+    %addr = gep i8 %s0, %off
+    %pp = gep i8 %addr, 24
+    %v = load i64, %pp
+    %nb = sub i64 0, blank
+    %keep = sub i64 %nb, 1
+    %v2 = and i64 %v, %keep
+    store i64 %pp, %v2
+    br regen(edit, ops, key, node, n0, n1, newlevel)
+  regen(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, newlevel: i64):
+    br rg_loop(edit, ops, key, node, n0, n1, newlevel, 0)
+  rg_loop(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, newlevel: i64, i: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, rg_body(edit, ops, key, node, n0, n1, newlevel, i), rg_done(edit, ops, key, node, n0, n1, newlevel)
+  rg_body(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, newlevel: i64, i: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %base = and i64 %ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %lv32 = trunc i32 newlevel
+    %seg = call i64 kla_call_chunk(ops, 8, %leaf, %lv32)
+    %sh = and i64 newlevel, 63
+    %seg2 = lshr i64 %seg, %sh
+    %val = and i64 %seg2, 15
+    call void kla_seg_st(edit, i, %val)
+    %i1 = add i64 i, 1
+    br rg_loop(edit, ops, key, node, n0, n1, newlevel, %i1)
+  rg_done(edit: ptr, ops: ptr, key: ptr, node: ptr, n0: ptr, n1: ptr, newlevel: i64):
+    %lv32 = trunc i32 newlevel
+    %seg = call i64 kla_call_chunk(ops, 0, key, %lv32)
+    %sh = and i64 newlevel, 63
+    %seg2 = lshr i64 %seg, %sh
+    %val = and i64 %seg2, 15
+    call void kla_seg_st(edit, 16, %val)
+    call void kla_do_split(edit, ops, node, n0, n1)
+    ret 1
+  fail():
+    ret 0
+  bug():
+    call void kla_bug()
+    ret 0
+}
+
+fn kla_insert_mid_sc(ptr, ptr, ptr, i64, i64, i64, i64) -> i64 {
+  entry(edit: ptr, ops: ptr, sc: ptr, level: i64, sclevel: i64, scsegs: i64, diss: i64):
+    %diff0 = ctz i64 diss
+    %diff1 = and i64 %diff0, -4
+    %base = and i64 sclevel, -64
+    %diff = add i64 %diff1, %base
+    %bp = load i64, %sc
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, rootset(edit), bpset(edit, %sc, %bp)
+  rootset(edit: ptr):
+    %arr = call i64 kla_edit_ld(edit, 16)
+    call void kla_edit_st(edit, 256, %arr)
+    br excise(edit, %sc, level, sclevel, scsegs, %diff)
+  bpset(edit: ptr, sc: ptr, bp: i64):
+    %nd = and i64 bp, 2
+    %z = icmp.eq i64 %nd, 0
+    condbr %z, nodeset(edit, sc, bp), bug()
+  nodeset(edit: ptr, sc: ptr, bp: i64):
+    %base = and i64 bp, -4
+    %par = call ptr kla_fromval(%base)
+    %sp = gep i8 %sc, 8
+    %ps = load i32, %sp
+    %ps64 = sext i64 %ps
+    %off = mul i64 %ps64, 8
+    %addr = gep i8 %par, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 256, %av)
+    br excise(edit, sc, level, sclevel, scsegs, %diff)
+  excise(edit: ptr, sc: ptr, level: i64, sclevel: i64, scsegs: i64, diff: i64):
+    %sv = call i64 kla_ptrval(%sc)
+    %tag = or i64 %sv, 3
+    call void kla_edit_st(edit, 88, %tag)
+    %n0 = call ptr kla_kzalloc(152)
+    %n0v = call i64 kla_ptrval(%n0)
+    %z = icmp.eq i64 %n0v, 0
+    condbr %z, fail(), have(edit, sc, level, sclevel, scsegs, diff, %n0, %n0v)
+  have(edit: ptr, sc: ptr, level: i64, sclevel: i64, scsegs: i64, diff: i64, n0: ptr, n0v: i64):
+    %tag = or i64 n0v, 1
+    call void kla_edit_st(edit, 64, %tag)
+    call void kla_edit_st(edit, 240, n0v)
+    %l1 = add i64 level, 4
+    %gt = icmp.sgt i64 diff, %l1
+    condbr %gt, presc(edit, sc, scsegs, diff, n0, n0v, %l1), nopresc(edit, sc, scsegs, diff, n0, n0v)
+  presc(edit: ptr, sc: ptr, scsegs: i64, diff: i64, n0: ptr, n0v: i64, level: i64):
+    %ru = add i64 diff, 63
+    %ru2 = and i64 %ru, -64
+    %keylen = lshr i64 %ru2, 6
+    %bytes = mul i64 %keylen, 8
+    %size = add i64 %bytes, 24
+    %s0 = call ptr kla_kzalloc(%size)
+    %s0v = call i64 kla_ptrval(%s0)
+    %z = icmp.eq i64 %s0v, 0
+    condbr %z, fail(), presc2(edit, sc, scsegs, diff, n0, n0v, %keylen, %s0, %s0v)
+  presc2(edit: ptr, sc: ptr, scsegs: i64, diff: i64, n0: ptr, n0v: i64, keylen: i64, s0: ptr, s0v: i64):
+    %tag = or i64 s0v, 3
+    call void kla_edit_st(edit, 72, %tag)
+    call void kla_edit_st(edit, 264, %tag)
+    %bp = load i64, %sc
+    store i64 %s0, %bp
+    %sp = gep i8 %sc, 8
+    %ps = load i32, %sp
+    %tp = gep i8 %s0, 8
+    store i32 %tp, %ps
+    %n0t = or i64 n0v, 1
+    %np = gep i8 %s0, 16
+    store i64 %np, %n0t
+    %kp = gep i8 %s0, 12
+    %d32 = trunc i32 diff
+    store i32 %kp, %d32
+    store i64 %n0, %tag
+    %tp0 = gep i8 n0, 8
+    store i8 %tp0, 0
+    %src = gep i8 %sc, 24
+    %dst = gep i8 %s0, 24
+    %nbytes = mul i64 %keylen, 8
+    %r = call ptr memcpy(%dst, %src, %nbytes)
+    %cm = and i64 diff, 63
+    %blank = shl i64 -1, %cm
+    %nb = sub i64 0, %blank
+    %keep = sub i64 %nb, 1
+    %last = sub i64 %keylen, 1
+    %off = mul i64 %last, 8
+    %addr = gep i8 %s0, %off
+    %pp = gep i8 %addr, 24
+    %v = load i64, %pp
+    %v2 = and i64 %v, %keep
+    store i64 %pp, %v2
+    br side(edit, sc, scsegs, diff, n0)
+  nopresc(edit: ptr, sc: ptr, scsegs: i64, diff: i64, n0: ptr, n0v: i64):
+    %tag = or i64 n0v, 1
+    call void kla_edit_st(edit, 264, %tag)
+    %bp = load i64, %sc
+    store i64 %n0, %bp
+    %sp = gep i8 %sc, 8
+    %ps = load i32, %sp
+    %ps8 = trunc i8 %ps
+    %tp = gep i8 n0, 8
+    store i8 %tp, %ps8
+    br side(edit, sc, scsegs, diff, n0)
+  side(edit: ptr, sc: ptr, scsegs: i64, diff: i64, n0: ptr):
+    %np = gep i8 %sc, 16
+    %nn = load i64, %np
+    %base = and i64 %nn, -4
+    %side = call ptr kla_fromval(%base)
+    %nrp = gep i8 %side, 144
+    %nr = load i64, %nrp
+    %tn = gep i8 n0, 144
+    store i64 %tn, %nr
+    %sh = and i64 diff, 63
+    %seg = lshr i64 %scsegs, %sh
+    %scslot = and i64 %seg, 15
+    %l2 = add i64 diff, 4
+    %kp = gep i8 %sc, 12
+    %skip32 = load i32, %kp
+    %skip = sext i64 %skip32
+    %lt = icmp.slt i64 %l2, %skip
+    condbr %lt, postsc(edit, sc, n0, %side, %scslot, %skip), nopost(edit, sc, n0, %side, %scslot)
+  postsc(edit: ptr, sc: ptr, n0: ptr, side: ptr, scslot: i64, skip: i64):
+    %ru = add i64 skip, 63
+    %ru2 = and i64 %ru, -64
+    %keylen = lshr i64 %ru2, 6
+    %bytes = mul i64 %keylen, 8
+    %size = add i64 %bytes, 24
+    %s1 = call ptr kla_kzalloc(%size)
+    %s1v = call i64 kla_ptrval(%s1)
+    %z = icmp.eq i64 %s1v, 0
+    condbr %z, fail(), postsc2(edit, sc, n0, side, scslot, skip, %keylen, %s1, %s1v)
+  postsc2(edit: ptr, sc: ptr, n0: ptr, side: ptr, scslot: i64, skip: i64, keylen: i64, s1: ptr, s1v: i64):
+    %tag = or i64 s1v, 3
+    call void kla_edit_st(edit, 80, %tag)
+    %n0v = call i64 kla_ptrval(n0)
+    %n0t = or i64 %n0v, 1
+    store i64 %s1, %n0t
+    %tp = gep i8 %s1, 8
+    %ss32 = trunc i32 scslot
+    store i32 %tp, %ss32
+    %np = gep i8 %sc, 16
+    %nn = load i64, %np
+    %tp2 = gep i8 %s1, 16
+    store i64 %tp2, %nn
+    %kp = gep i8 %sc, 12
+    %skip32 = load i32, %kp
+    %tk = gep i8 %s1, 12
+    store i32 %tk, %skip32
+    %off = mul i64 scslot, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, %tag
+    %src = gep i8 %sc, 24
+    %dst = gep i8 %s1, 24
+    %nbytes = mul i64 %keylen, 8
+    %r = call ptr memcpy(%dst, %src, %nbytes)
+    %sav = call i64 kla_ptrval(%side)
+    call void kla_edit_st(edit, 272, %sav)
+    call void kla_edit_st(edit, 280, %tag)
+    br leafp(edit, n0, scslot)
+  nopost(edit: ptr, sc: ptr, n0: ptr, side: ptr, scslot: i64):
+    %np = gep i8 %sc, 16
+    %nn = load i64, %np
+    %off = mul i64 scslot, 8
+    %addr = gep i8 n0, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, %nn
+    %spa = gep i8 %side, 8
+    %sav = call i64 kla_ptrval(%spa)
+    call void kla_edit_st(edit, 288, %sav)
+    %spp = gep i8 edit, 296
+    %ss8 = trunc i8 scslot
+    store i8 %spp, %ss8
+    %sbp = call i64 kla_ptrval(%side)
+    call void kla_edit_st(edit, 272, %sbp)
+    %n0v = call i64 kla_ptrval(n0)
+    %n0t = or i64 %n0v, 1
+    call void kla_edit_st(edit, 280, %n0t)
+    br leafp(edit, n0, scslot)
+  leafp(edit: ptr, n0: ptr, scslot: i64):
+    %z = icmp.eq i64 %scslot, 0
+    condbr %z, leaf1(edit, n0), leaf0(edit, n0)
+  leaf1(edit: ptr, n0: ptr):
+    %addr = gep i8 n0, 24
+    %av = call i64 kla_ptrval(%addr)
+    call void kla_edit_st(edit, 48, %av)
+    ret 1
+  leaf0(edit: ptr, n0: ptr):
+    %addr = gep i8 n0, 16
+    %av = call i64 kla_ptrval(%addr)
+    call void kla_edit_st(edit, 48, %av)
+    ret 1
+  fail():
+    ret 0
+  bug():
+    call void kla_bug()
+    ret 0
+}
+
+fn kla_errptr() -> ptr {
+  entry():
+    %p = call ptr kla_fromval(-12)
+    ret %p
+}
+
+fn assoc_array_insert(ptr, ptr, ptr, ptr) -> ptr {
+  entry(array: ptr, ops: ptr, key: ptr, object: ptr):
+    %ov = call i64 kla_ptrval(object)
+    %meta = and i64 %ov, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, bug(), alloc(array, ops, key, object, %ov)
+  alloc(array: ptr, ops: ptr, key: ptr, object: ptr, ov: i64):
+    %edit = call ptr kla_kzalloc(328)
+    %ev = call i64 kla_ptrval(%edit)
+    %z = icmp.eq i64 %ev, 0
+    condbr %z, enomem0(), setup(array, ops, key, object, ov, %edit)
+  setup(array: ptr, ops: ptr, key: ptr, object: ptr, ov: i64, edit: ptr):
+    %av = call i64 kla_ptrval(array)
+    call void kla_edit_st(edit, 16, %av)
+    %opv = call i64 kla_ptrval(ops)
+    call void kla_edit_st(edit, 24, %opv)
+    call void kla_edit_st(edit, 40, ov)
+    call void kla_edit_st(edit, 248, 1)
+    %onode = alloca 8, 8
+    %olevel = alloca 8, 8
+    %oslot = alloca 8, 8
+    %osc = alloca 8, 8
+    %osclevel = alloca 8, 8
+    %oscseg = alloca 8, 8
+    %odiss = alloca 8, 8
+    %st = call i64 kla_walk(array, ops, key, %onode, %olevel, %oslot, %osc, %osclevel, %oscseg, %odiss)
+    %z = icmp.eq i64 %st, 0
+    condbr %z, st_empty(edit), chk_term(edit, ops, key, %st, %onode, %olevel, %oslot, %osc, %osclevel, %oscseg, %odiss)
+  st_empty(edit: ptr):
+    %ok = call i64 kla_insert_in_empty_tree(edit)
+    %nz = icmp.ne i64 %ok, 0
+    condbr %nz, retedit(edit), enomem(edit)
+  chk_term(edit: ptr, ops: ptr, key: ptr, st: i64, onode: ptr, olevel: ptr, oslot: ptr, osc: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr):
+    %eq = icmp.eq i64 st, 1
+    condbr %eq, st_term(edit, ops, key, onode, olevel, oslot), st_wrong(edit, ops, osc, olevel, osclevel, oscseg, odiss)
+  st_term(edit: ptr, ops: ptr, key: ptr, onode: ptr, olevel: ptr, oslot: ptr):
+    %node = load ptr, %onode
+    %level = load i64, %olevel
+    %slot = load i64, %oslot
+    %ok = call i64 kla_insert_terminal(edit, ops, key, %node, %level, %slot)
+    %nz = icmp.ne i64 %ok, 0
+    condbr %nz, retedit(edit), enomem(edit)
+  st_wrong(edit: ptr, ops: ptr, osc: ptr, olevel: ptr, osclevel: ptr, oscseg: ptr, odiss: ptr):
+    %sc = load ptr, %osc
+    %level = load i64, %olevel
+    %sclevel = load i64, %osclevel
+    %scseg = load i64, %oscseg
+    %diss = load i64, %odiss
+    %ok = call i64 kla_insert_mid_sc(edit, ops, %sc, %level, %sclevel, %scseg, %diss)
+    %nz = icmp.ne i64 %ok, 0
+    condbr %nz, retedit(edit), enomem(edit)
+  retedit(edit: ptr):
+    ret edit
+  enomem(edit: ptr):
+    call void assoc_array_cancel_edit(edit)
+    br enomem0()
+  enomem0():
+    %e = call ptr kla_errptr()
+    ret %e
+  bug():
+    call void kla_bug()
+    %e = call ptr kla_errptr()
+    ret %e
+}
+
+fn assoc_array_insert_set_object(ptr, ptr) -> void {
+  entry(edit: ptr, object: ptr):
+    %ov = call i64 kla_ptrval(object)
+    %z = icmp.eq i64 %ov, 0
+    condbr %z, bug(), go(edit, %ov)
+  go(edit: ptr, ov: i64):
+    call void kla_edit_st(edit, 40, ov)
+    ret
+  bug():
+    call void kla_bug()
+    ret
+}
+
+fn kla_delete_collapse_iterator(ptr, ptr) -> i32 {
+  entry(leaf: ptr, data: ptr):
+    %lv = call i64 kla_ptrval(leaf)
+    %skip = gep i8 data, 8
+    %skipv = load i64, %skip
+    %eq = icmp.eq i64 %lv, %skipv
+    condbr %eq, retzero(), go(leaf, data, %lv)
+  go(leaf: ptr, data: ptr, lv: i64):
+    %sp = gep i8 data, 16
+    %slot32 = load i32, %sp
+    %slot = sext i64 %slot32
+    %ge = icmp.sge i64 %slot, 16
+    condbr %ge, bug(), put(data, lv, %slot)
+  put(data: ptr, lv: i64, slot: i64):
+    %np = load ptr, data
+    %off = mul i64 slot, 8
+    %addr = gep i8 %np, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, lv
+    %sp = gep i8 data, 16
+    %s1 = add i64 slot, 1
+    %s32 = trunc i32 %s1
+    store i32 %sp, %s32
+    ret 0
+  retzero():
+    ret 0
+  bug():
+    call void kla_bug()
+    ret 0
+}
+
+fn assoc_array_delete(ptr, ptr, ptr) -> ptr {
+  entry(array: ptr, ops: ptr, key: ptr):
+    %edit = call ptr kla_kzalloc(328)
+    %ev = call i64 kla_ptrval(%edit)
+    %z = icmp.eq i64 %ev, 0
+    condbr %z, enomem0(), setup(array, ops, key, %edit)
+  setup(array: ptr, ops: ptr, key: ptr, edit: ptr):
+    %av = call i64 kla_ptrval(array)
+    call void kla_edit_st(edit, 16, %av)
+    %opv = call i64 kla_ptrval(ops)
+    call void kla_edit_st(edit, 24, %opv)
+    call void kla_edit_st(edit, 248, -1)
+    %onode = alloca 8, 8
+    %olevel = alloca 8, 8
+    %oslot = alloca 8, 8
+    %osc = alloca 8, 8
+    %osclevel = alloca 8, 8
+    %oscseg = alloca 8, 8
+    %odiss = alloca 8, 8
+    %st = call i64 kla_walk(array, ops, key, %onode, %olevel, %oslot, %osc, %osclevel, %oscseg, %odiss)
+    %eq = icmp.eq i64 %st, 1
+    condbr %eq, scan(array, ops, key, edit, %onode, 0), notfound(edit)
+  scan(array: ptr, ops: ptr, key: ptr, edit: ptr, onode: ptr, slot: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, sbody(array, ops, key, edit, onode, slot), notfound(edit)
+  sbody(array: ptr, ops: ptr, key: ptr, edit: ptr, onode: ptr, slot: i64):
+    %node = load ptr, %onode
+    %off = mul i64 slot, 8
+    %addr = gep i8 %node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %nz = icmp.ne i64 %ptr, 0
+    condbr %nz, schk(array, ops, key, edit, onode, slot, %node, %ptr), snext(array, ops, key, edit, onode, slot)
+  schk(array: ptr, ops: ptr, key: ptr, edit: ptr, onode: ptr, slot: i64, node: ptr, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, scmp(array, ops, key, edit, onode, slot, node, ptr), snext(array, ops, key, edit, onode, slot)
+  scmp(array: ptr, ops: ptr, key: ptr, edit: ptr, onode: ptr, slot: i64, node: ptr, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %r = call i32 kla_call_cmpobj(ops, 16, %leaf, key)
+    %nz = icmp.ne i32 %r, 0
+    condbr %nz, found(array, edit, node, slot), snext(array, ops, key, edit, onode, slot)
+  snext(array: ptr, ops: ptr, key: ptr, edit: ptr, onode: ptr, slot: i64):
+    %s1 = add i64 slot, 1
+    br scan(array, ops, key, edit, onode, %s1)
+  found(array: ptr, edit: ptr, node: ptr, slot: i64):
+    %np = gep i8 array, 8
+    %nr = load i64, %np
+    %z = icmp.eq i64 %nr, 0
+    condbr %z, bug(), fgo(array, edit, node, slot, %nr)
+  fgo(array: ptr, edit: ptr, node: ptr, slot: i64, nr: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %dead = load i64, %pp
+    call void kla_edit_st(edit, 56, %dead)
+    %av2 = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 256, %av2)
+    call void kla_edit_st(edit, 264, 0)
+    %nv = call i64 kla_ptrval(node)
+    call void kla_edit_st(edit, 240, %nv)
+    %one = icmp.eq i64 nr, 1
+    condbr %one, lastone(array, edit), collapsechk(array, edit, node)
+  lastone(array: ptr, edit: ptr):
+    %av = call i64 kla_ptrval(array)
+    call void kla_edit_st(edit, 272, %av)
+    call void kla_edit_st(edit, 280, 0)
+    call void kla_edit_st(edit, 240, 0)
+    %root = load i64, array
+    call void kla_edit_st(edit, 96, %root)
+    ret edit
+  collapsechk(array: ptr, edit: ptr, node: ptr):
+    %nrp = gep i8 node, 144
+    %br = load i64, %nrp
+    %le = icmp.ule i64 %br, 17
+    condbr %le, meta_scan(array, edit, node, 0, 0), retedit(edit)
+  meta_scan(array: ptr, edit: ptr, node: ptr, i: i64, has_meta: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, ms_body(array, edit, node, i, has_meta), collapse_up(array, edit, node, node, has_meta)
+  ms_body(array: ptr, edit: ptr, node: ptr, i: i64, has_meta: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %meta = and i64 %ptr, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, ms_next(array, edit, node, i, 1), ms_next(array, edit, node, i, has_meta)
+  ms_next(array: ptr, edit: ptr, node: ptr, i: i64, has_meta: i64):
+    %i1 = add i64 i, 1
+    br meta_scan(array, edit, node, %i1, has_meta)
+  collapse_up(array: ptr, edit: ptr, node: ptr, parent: ptr, has_meta: i64):
+    %bp = load i64, %parent
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, do_collapse(array, edit, node, parent, has_meta), cu_chk(array, edit, node, parent, has_meta, %bp)
+  cu_chk(array: ptr, edit: ptr, node: ptr, parent: ptr, has_meta: i64, bp: i64):
+    %sc = and i64 bp, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, cu_sc(array, edit, node, parent, has_meta, bp), cu_gp(array, edit, node, parent, has_meta, bp)
+  cu_sc(array: ptr, edit: ptr, node: ptr, parent: ptr, has_meta: i64, bp: i64):
+    %base = and i64 bp, -4
+    %sc = call ptr kla_fromval(%base)
+    %nbp = load i64, %sc
+    %z = icmp.eq i64 %nbp, 0
+    condbr %z, do_collapse(array, edit, node, parent, has_meta), cu_gp(array, edit, node, parent, has_meta, %nbp)
+  cu_gp(array: ptr, edit: ptr, node: ptr, parent: ptr, has_meta: i64, bp: i64):
+    %base = and i64 bp, -4
+    %gp = call ptr kla_fromval(%base)
+    %nrp = gep i8 %gp, 144
+    %br = load i64, %nrp
+    %le = icmp.ule i64 %br, 17
+    condbr %le, collapse_up(array, edit, node, %gp, has_meta), do_collapse(array, edit, node, parent, has_meta)
+  do_collapse(array: ptr, edit: ptr, node: ptr, parent: ptr, has_meta: i64):
+    %nz = icmp.ne i64 has_meta, 0
+    condbr %nz, collapse(array, edit, parent), dc_chk(array, edit, node, parent)
+  dc_chk(array: ptr, edit: ptr, node: ptr, parent: ptr):
+    %pv = call i64 kla_ptrval(parent)
+    %nv0 = call i64 kla_ptrval(node)
+    %diff = icmp.ne i64 %pv, %nv0
+    condbr %diff, collapse(array, edit, parent), retedit(edit)
+  collapse(array: ptr, edit: ptr, node: ptr):
+    %n0 = call ptr kla_kzalloc(152)
+    %n0v = call i64 kla_ptrval(%n0)
+    %z = icmp.eq i64 %n0v, 0
+    condbr %z, enomem(edit), cgo(array, edit, node, %n0, %n0v)
+  cgo(array: ptr, edit: ptr, node: ptr, n0: ptr, n0v: i64):
+    %ctx = call ptr kla_kzalloc(24)
+    %cv = call i64 kla_ptrval(%ctx)
+    %z0 = icmp.eq i64 %cv, 0
+    condbr %z0, ctxfail(edit, n0), cbody(array, edit, node, n0, n0v, %ctx)
+  ctxfail(edit: ptr, n0: ptr):
+    call void kfree(n0)
+    br enomem(edit)
+  cbody(array: ptr, edit: ptr, node: ptr, n0: ptr, n0v: i64, ctx: ptr):
+    %tag = or i64 n0v, 1
+    call void kla_edit_st(edit, 64, %tag)
+    %bp = load i64, node
+    store i64 %n0, %bp
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %tp = gep i8 n0, 8
+    store i8 %tp, %ps
+    %nrp = gep i8 node, 144
+    %br = load i64, %nrp
+    %tn = gep i8 n0, 144
+    store i64 %tn, %br
+    call void kla_edit_st(edit, 240, n0v)
+    store ptr ctx, %n0
+    %dead = call i64 kla_edit_ld(edit, 56)
+    %leaf = and i64 %dead, -2
+    %cp = gep i8 %ctx, 8
+    store i64 %cp, %leaf
+    %csp = gep i8 %ctx, 16
+    store i32 %csp, 0
+    %nv = call i64 kla_ptrval(node)
+    %ntag = or i64 %nv, 1
+    %iter = funcptr kla_delete_collapse_iterator
+    %r = call i32 kla_subtree_iterate(%ntag, %bp, %iter, %ctx)
+    %slot32 = load i32, %csp
+    call void kfree(ctx)
+    %slot = sext i64 %slot32
+    %want = sub i64 %br, 1
+    %ne = icmp.ne i64 %slot, %want
+    condbr %ne, bug(), cset(array, edit, node, n0, %tag)
+  cset(array: ptr, edit: ptr, node: ptr, n0: ptr, tag: i64):
+    %bp = load i64, node
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, croot(array, edit, tag), cchk(array, edit, node, tag, %bp)
+  croot(array: ptr, edit: ptr, tag: i64):
+    %av = call i64 kla_ptrval(array)
+    call void kla_edit_st(edit, 272, %av)
+    br cfin(array, edit, node, tag)
+  cchk(array: ptr, edit: ptr, node: ptr, tag: i64, bp: i64):
+    %leaf = and i64 bp, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, bug(), cchk2(array, edit, node, tag, bp)
+  cchk2(array: ptr, edit: ptr, node: ptr, tag: i64, bp: i64):
+    %nd = and i64 bp, 2
+    %z = icmp.eq i64 %nd, 0
+    condbr %z, cnode(array, edit, node, tag, bp), csc(array, edit, node, tag, bp)
+  cnode(array: ptr, edit: ptr, node: ptr, tag: i64, bp: i64):
+    %base = and i64 bp, -4
+    %par = call ptr kla_fromval(%base)
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %ps64 = zext i64 %ps
+    %off = mul i64 %ps64, 8
+    %addr = gep i8 %par, %off
+    %pp = gep i8 %addr, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 272, %av)
+    br cfin(array, edit, node, tag)
+  csc(array: ptr, edit: ptr, node: ptr, tag: i64, bp: i64):
+    %base = and i64 bp, -4
+    %sc = call ptr kla_fromval(%base)
+    %pp = gep i8 %sc, 16
+    %av = call i64 kla_ptrval(%pp)
+    call void kla_edit_st(edit, 272, %av)
+    br cfin(array, edit, node, tag)
+  cfin(array: ptr, edit: ptr, node: ptr, tag: i64):
+    call void kla_edit_st(edit, 280, tag)
+    %nv = call i64 kla_ptrval(node)
+    %ntag = or i64 %nv, 1
+    call void kla_edit_st(edit, 96, %ntag)
+    ret edit
+  retedit(edit: ptr):
+    ret edit
+  notfound(edit: ptr):
+    call void assoc_array_cancel_edit(edit)
+    %null = call ptr kla_null()
+    ret %null
+  enomem(edit: ptr):
+    call void assoc_array_cancel_edit(edit)
+    br enomem0()
+  enomem0():
+    %e = call ptr kla_errptr()
+    ret %e
+  bug():
+    call void kla_bug()
+    %null = call ptr kla_null()
+    ret %null
+}
+
+fn assoc_array_clear(ptr, ptr) -> ptr {
+  entry(array: ptr, ops: ptr):
+    %root = load i64, array
+    %z = icmp.eq i64 %root, 0
+    condbr %z, nullret(), alloc(array, ops, %root)
+  alloc(array: ptr, ops: ptr, root: i64):
+    %edit = call ptr kla_kzalloc(328)
+    %ev = call i64 kla_ptrval(%edit)
+    %z = icmp.eq i64 %ev, 0
+    condbr %z, enomem0(), setup(array, ops, root, %edit)
+  setup(array: ptr, ops: ptr, root: i64, edit: ptr):
+    %av = call i64 kla_ptrval(array)
+    call void kla_edit_st(edit, 16, %av)
+    %opv = call i64 kla_ptrval(ops)
+    call void kla_edit_st(edit, 24, %opv)
+    call void kla_edit_st(edit, 272, %av)
+    call void kla_edit_st(edit, 280, 0)
+    call void kla_edit_st(edit, 96, root)
+    call void kla_edit_st(edit, 32, %opv)
+    ret edit
+  enomem0():
+    %e = call ptr kla_errptr()
+    ret %e
+  nullret():
+    %null = call ptr kla_null()
+    ret %null
+}
+
+fn assoc_array_cancel_edit(ptr) -> void {
+  entry(edit: ptr):
+    br loop(edit, 0)
+  loop(edit: ptr, i: i64):
+    %lt = icmp.slt i64 i, 3
+    condbr %lt, body(edit, i), fin(edit)
+  body(edit: ptr, i: i64):
+    %off = mul i64 i, 8
+    %eo = add i64 %off, 64
+    %v = call i64 kla_edit_ld(edit, %eo)
+    %nz = icmp.ne i64 %v, 0
+    condbr %nz, free(edit, i, %v), next(edit, i)
+  free(edit: ptr, i: i64, v: i64):
+    %base = and i64 v, -4
+    %obj = call ptr kla_fromval(%base)
+    call void kfree(%obj)
+    br next(edit, i)
+  next(edit: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br loop(edit, %i1)
+  fin(edit: ptr):
+    call void kfree(edit)
+    ret
+}
+
+fn kla_rcu_cleanup(ptr) -> void {
+  entry(edit: ptr):
+    %dead = call i64 kla_edit_ld(edit, 56)
+    %nz = icmp.ne i64 %dead, 0
+    condbr %nz, freedead(edit, %dead), meta(edit)
+  freedead(edit: ptr, dead: i64):
+    %opv = call i64 kla_edit_ld(edit, 24)
+    %ops = call ptr kla_fromval(%opv)
+    %base = and i64 %dead, -2
+    %leaf = call ptr kla_fromval(%base)
+    call void kla_call_free(%ops, 32, %leaf)
+    br meta(edit)
+  meta(edit: ptr):
+    %em = call i64 kla_edit_ld(edit, 88)
+    %nz = icmp.ne i64 %em, 0
+    condbr %nz, freemeta(edit, %em), subtree(edit)
+  freemeta(edit: ptr, em: i64):
+    %base = and i64 em, -4
+    %obj = call ptr kla_fromval(%base)
+    call void kfree(%obj)
+    br subtree(edit)
+  subtree(edit: ptr):
+    %es = call i64 kla_edit_ld(edit, 96)
+    %nz = icmp.ne i64 %es, 0
+    condbr %nz, subchk(edit, %es), fin(edit)
+  subchk(edit: ptr, es: i64):
+    %leaf = and i64 %es, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, bug(), subgo(edit, %es)
+  subgo(edit: ptr, es: i64):
+    %base = and i64 %es, -4
+    %obj = call ptr kla_fromval(%base)
+    store i64 %obj, 0
+    %opv = call i64 kla_edit_ld(edit, 32)
+    %ops = call ptr kla_fromval(%opv)
+    call void kla_destroy_subtree(%es, %ops)
+    br fin(edit)
+  fin(edit: ptr):
+    call void kfree(edit)
+    ret
+  bug():
+    call void kla_bug()
+    ret
+}
+
+fn assoc_array_apply_edit(ptr) -> void {
+  entry(edit: ptr):
+    fence.release
+    %lp = call i64 kla_edit_ld(edit, 48)
+    %nz = icmp.ne i64 %lp, 0
+    condbr %nz, setleaf(edit, %lp), f2(edit)
+  setleaf(edit: ptr, lp: i64):
+    %leaf = call i64 kla_edit_ld(edit, 40)
+    %addr = call ptr kla_fromval(lp)
+    store i64 %addr, %leaf
+    br f2(edit)
+  f2(edit: ptr):
+    fence.release
+    %pp = call i64 kla_edit_ld(edit, 288)
+    %nz = icmp.ne i64 %pp, 0
+    condbr %nz, setps(edit, %pp), f3(edit)
+  setps(edit: ptr, pp: i64):
+    %ep = gep i8 edit, 296
+    %to = load i8, %ep
+    %addr = call ptr kla_fromval(pp)
+    store i8 %addr, %to
+    br f3(edit)
+  f3(edit: ptr):
+    fence.release
+    br bploop(edit, 0)
+  bploop(edit: ptr, i: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, bpbody(edit, i), f4(edit)
+  bpbody(edit: ptr, i: i64):
+    %off = mul i64 i, 8
+    %eo = add i64 %off, 104
+    %bp = call i64 kla_edit_ld(edit, %eo)
+    %nz = icmp.ne i64 %bp, 0
+    condbr %nz, bpset(edit, i, %bp), bpnext(edit, i)
+  bpset(edit: ptr, i: i64, bp: i64):
+    %to = call i64 kla_edit_ld(edit, 232)
+    %addr = call ptr kla_fromval(bp)
+    store i64 %addr, %to
+    br bpnext(edit, i)
+  bpnext(edit: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br bploop(edit, %i1)
+  f4(edit: ptr):
+    fence.release
+    br setloop(edit, 0)
+  setloop(edit: ptr, i: i64):
+    %lt = icmp.slt i64 i, 2
+    condbr %lt, setbody(edit, i), counts(edit)
+  setbody(edit: ptr, i: i64):
+    %off = mul i64 i, 16
+    %eo = add i64 %off, 256
+    %p = call i64 kla_edit_ld(edit, %eo)
+    %nz = icmp.ne i64 %p, 0
+    condbr %nz, setdo(edit, i, %p), setnext(edit, i)
+  setdo(edit: ptr, i: i64, p: i64):
+    %off = mul i64 i, 16
+    %eo = add i64 %off, 264
+    %to = call i64 kla_edit_ld(edit, %eo)
+    %addr = call ptr kla_fromval(p)
+    store i64 %addr, %to
+    br setnext(edit, i)
+  setnext(edit: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br setloop(edit, %i1)
+  counts(edit: ptr):
+    %av = call i64 kla_edit_ld(edit, 16)
+    %array = call ptr kla_fromval(%av)
+    %root = load i64, %array
+    %z = icmp.eq i64 %root, 0
+    condbr %z, zero(array, edit), adjchk(edit, %array)
+  zero(array: ptr, edit: ptr):
+    %np = gep i8 %array, 8
+    store i64 %np, 0
+    br rcu(edit)
+  adjchk(edit: ptr, array: ptr):
+    %adj = call i64 kla_edit_ld(edit, 240)
+    %nz = icmp.ne i64 %adj, 0
+    condbr %nz, adjloop(edit, array, %adj), rcu(edit)
+  adjloop(edit: ptr, array: ptr, nodev: i64):
+    %base = and i64 nodev, -4
+    %node = call ptr kla_fromval(%base)
+    %nrp = gep i8 %node, 144
+    %nr = load i64, %nrp
+    %by = call i64 kla_edit_ld(edit, 248)
+    %nr2 = add i64 %nr, %by
+    store i64 %nrp, %nr2
+    %bp = load i64, %node
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, addtree(edit, array), adjsc(edit, array, %bp)
+  adjsc(edit: ptr, array: ptr, bp: i64):
+    %sc = and i64 bp, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, adjsc2(edit, array, bp), adjnode(edit, array, bp)
+  adjsc2(edit: ptr, array: ptr, bp: i64):
+    %base = and i64 bp, -4
+    %sc = call ptr kla_fromval(%base)
+    %nbp = load i64, %sc
+    %z = icmp.eq i64 %nbp, 0
+    condbr %z, addtree(edit, array), adjnode(edit, array, %nbp)
+  adjnode(edit: ptr, array: ptr, bp: i64):
+    %isnode = and i64 bp, 2
+    %nz = icmp.ne i64 %isnode, 0
+    condbr %nz, bug(), adjloop(edit, array, bp)
+  addtree(edit: ptr, array: ptr):
+    %np = gep i8 %array, 8
+    %nr = load i64, %np
+    %by = call i64 kla_edit_ld(edit, 248)
+    %nr2 = add i64 %nr, %by
+    store i64 %np, %nr2
+    br rcu(edit)
+  rcu(edit: ptr):
+    %fn = funcptr kla_rcu_cleanup
+    call void call_rcu(edit, %fn)
+    ret
+  bug():
+    call void kla_bug()
+    ret
+}
+
+fn assoc_array_gc(ptr, ptr, ptr, ptr) -> i32 {
+  entry(array: ptr, ops: ptr, iter: ptr, data: ptr):
+    %slot = alloca 8, 8
+    store ptr %slot, iter
+    %root = load i64, array
+    %z = icmp.eq i64 %root, 0
+    condbr %z, retzero(), alloc(array, ops, %slot, data, %root)
+  alloc(array: ptr, ops: ptr, iter: ptr, data: ptr, root: i64):
+    %edit = call ptr kla_kzalloc(328)
+    %ev = call i64 kla_ptrval(%edit)
+    %z = icmp.eq i64 %ev, 0
+    condbr %z, enomem0(), setup(array, ops, iter, data, root, %edit)
+  setup(array: ptr, ops: ptr, iter: ptr, data: ptr, root: i64, edit: ptr):
+    %av = call i64 kla_ptrval(array)
+    call void kla_edit_st(edit, 16, %av)
+    %opv = call i64 kla_ptrval(ops)
+    call void kla_edit_st(edit, 24, %opv)
+    call void kla_edit_st(edit, 32, %opv)
+    call void kla_edit_st(edit, 256, %av)
+    call void kla_edit_st(edit, 96, root)
+    %slot = alloca 8, 8
+    store i64 %slot, 0
+    br descend(array, ops, iter, data, edit, %slot, root, 0, %slot, 0)
+  descend(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, cursor: i64, new_parent: i64, new_pp: ptr, nr_tree: i64):
+    %sc = and i64 cursor, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, sc_dup(array, ops, iter, data, edit, root_slot, cursor, new_parent, new_pp, nr_tree), node_dup(array, ops, iter, data, edit, root_slot, cursor, new_parent, new_pp, nr_tree)
+  sc_dup(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, cursor: i64, new_parent: i64, new_pp: ptr, nr_tree: i64):
+    %base = and i64 cursor, -4
+    %sc = call ptr kla_fromval(%base)
+    %kp = gep i8 %sc, 12
+    %skip32 = load i32, %kp
+    %skip = sext i64 %skip32
+    %ru = add i64 %skip, 63
+    %ru2 = and i64 %ru, -64
+    %keylen = lshr i64 %ru2, 6
+    %bytes = mul i64 %keylen, 8
+    %size = add i64 %bytes, 24
+    %ns = call ptr __kmalloc_noprof(%size, 3276)
+    %nv = call i64 kla_ptrval(%ns)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, enomem(edit, root_slot, ops), sc_dup2(array, ops, iter, data, edit, root_slot, %sc, new_parent, new_pp, nr_tree, %keylen, %size, %ns, %nv)
+  sc_dup2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, sc: ptr, new_parent: i64, new_pp: ptr, nr_tree: i64, keylen: i64, size: i64, ns: ptr, nsv: i64):
+    %r = call ptr memcpy(%ns, %sc, size)
+    store i64 %ns, new_parent
+    %sp = gep i8 %sc, 8
+    %ps = load i32, %sp
+    %tp = gep i8 %ns, 8
+    store i32 %tp, %ps
+    %tag = or i64 %nsv, 3
+    store i64 %new_pp, %tag
+    %npp = gep i8 %ns, 16
+    %np2 = gep i8 %sc, 16
+    %nn = load i64, %np2
+    br node_dup(array, ops, iter, data, edit, root_slot, %nn, %tag, %npp, nr_tree)
+  node_dup(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, cursor: i64, new_parent: i64, new_pp: ptr, nr_tree: i64):
+    %base = and i64 cursor, -4
+    %node = call ptr kla_fromval(%base)
+    %nn = call ptr kla_kzalloc(152)
+    %nv = call i64 kla_ptrval(%nn)
+    %z = icmp.eq i64 %nv, 0
+    condbr %z, enomem(edit, root_slot, ops), node_dup2(array, ops, iter, data, edit, root_slot, %node, new_parent, new_pp, nr_tree, %nn, %nv)
+  node_dup2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_parent: i64, new_pp: ptr, nr_tree: i64, nn: ptr, nnv: i64):
+    store i64 %nn, new_parent
+    %sp = gep i8 %node, 8
+    %ps = load i8, %sp
+    %tp = gep i8 %nn, 8
+    store i8 %tp, %ps
+    %tag = or i64 %nnv, 1
+    store i64 %new_pp, %tag
+    br continue_node(array, ops, iter, data, edit, root_slot, node, %nn, 0, nr_tree)
+  continue_node(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, cn_body(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree), compress(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree)
+  cn_body(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %node, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %z = icmp.eq i64 %ptr, 0
+    condbr %z, cn_next(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree), cn_chk(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree, %ptr)
+  cn_chk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, cn_leaf(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree, ptr), cn_meta(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree, ptr)
+  cn_leaf(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64, ptr: i64):
+    %base = and i64 ptr, -2
+    %leaf = call ptr kla_fromval(%base)
+    %r = call i32 kla_call_gciter(%iter, %leaf, data)
+    %nz = icmp.ne i32 %r, 0
+    condbr %nz, cn_keep(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree, ptr), cn_next(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree)
+  cn_keep(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64, ptr: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, ptr
+    br cn_next(array, ops, iter, data, edit, root_slot, node, new_n, slot, nr_tree)
+  cn_meta(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64, ptr: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %new_n, %off
+    %npp = gep i8 %addr, 16
+    %nv = call i64 kla_ptrval(%new_n)
+    %tag = or i64 %nv, 1
+    br descend(array, ops, iter, data, edit, root_slot, ptr, %tag, %npp, nr_tree)
+  cn_next(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, slot: i64, nr_tree: i64):
+    %s1 = add i64 slot, 1
+    br continue_node(array, ops, iter, data, edit, root_slot, node, new_n, %s1, nr_tree)
+  compress(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64):
+    br cnt_loop(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, 0, 0, 0)
+  cnt_loop(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, cnt_body(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free), cnt_done(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, nr, nr_free)
+  cnt_body(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %z = icmp.eq i64 %ptr, 0
+    condbr %z, cnt_free(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free), cnt_leaf(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, %ptr)
+  cnt_free(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64):
+    %f1 = add i64 nr_free, 1
+    %s1 = add i64 slot, 1
+    br cnt_loop(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %s1, nr, %f1)
+  cnt_leaf(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, cnt_inc(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free), cnt_next(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free)
+  cnt_inc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64):
+    %n1 = add i64 nr, 1
+    %s1 = add i64 slot, 1
+    br cnt_loop(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %s1, %n1, nr_free)
+  cnt_next(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64):
+    %s1 = add i64 slot, 1
+    br cnt_loop(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %s1, nr, nr_free)
+  cnt_done(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, nr: i64, nr_free: i64):
+    %nrp = gep i8 %new_n, 144
+    store i64 %nrp, nr
+    br fold_loop(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, 0, nr, nr_free, 0, 0)
+  fold_loop(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64):
+    %lt = icmp.slt i64 slot, 16
+    condbr %lt, fold_body(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot), fold_done(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, nr, nr_free, retained)
+  fold_body(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %z = icmp.eq i64 %ptr, 0
+    condbr %z, fold_next(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot), fold_chk(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, %ptr)
+  fold_chk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, ptr: i64):
+    %leaf = and i64 ptr, 1
+    %z = icmp.eq i64 %leaf, 0
+    condbr %z, fold_next(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot), fold_meta(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, ptr)
+  fold_meta(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, ptr: i64):
+    %sc = and i64 ptr, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, fold_sc(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, ptr), fold_child(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, ptr, 0)
+  fold_sc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, ptr: i64):
+    %base = and i64 ptr, -4
+    %s = call ptr kla_fromval(%base)
+    %np = gep i8 %s, 16
+    %nn = load i64, %np
+    %sv = call i64 kla_ptrval(%s)
+    br fold_child(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, %nn, %sv)
+  fold_child(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, childptr: i64, s: i64):
+    %base = and i64 childptr, -4
+    %child = call ptr kla_fromval(%base)
+    %nrp = gep i8 %child, 144
+    %cnr = load i64, %nrp
+    %nr2 = add i64 nr, %cnr
+    %lim = add i64 nr_free, 1
+    %le = icmp.ule i64 %cnr, %lim
+    condbr %le, fold_do(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, %nr2, nr_free, retained, next_slot, %child, s), fold_retain(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, %nr2, nr_free, next_slot)
+  fold_retain(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, next_slot: i64):
+    br fold_next(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, 1, next_slot)
+  fold_do(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, s: i64):
+    %nz = icmp.ne i64 s, 0
+    condbr %nz, bug(), fold_do2(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child)
+  fold_do2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, 0
+    %f1 = add i64 nr_free, 1
+    %back = icmp.slt i64 slot, next_slot
+    condbr %back, fold_do3(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, %f1, retained, slot, child), fold_do3(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, %f1, retained, next_slot, child)
+  fold_do3(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr):
+    br fold_copy(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, 0)
+  fold_copy(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, i: i64):
+    %lt = icmp.slt i64 i, 16
+    condbr %lt, fold_cpbody(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, i), fold_cpdone(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child)
+  fold_cpbody(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, i: i64):
+    %off = mul i64 i, 8
+    %addr = gep i8 %child, %off
+    %pp = gep i8 %addr, 16
+    %p = load i64, %pp
+    %z = icmp.eq i64 %p, 0
+    condbr %z, fold_cpnext(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, i), fold_cpchk(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, i, %p)
+  fold_cpchk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, i: i64, p: i64):
+    %meta = and i64 p, 1
+    %nz = icmp.ne i64 %meta, 0
+    condbr %nz, bug(), fold_scan(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, i, p, next_slot)
+  fold_scan(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, i: i64, p: i64, cand: i64):
+    %off = mul i64 cand, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    %v = load i64, %pp
+    %z = icmp.eq i64 %v, 0
+    condbr %z, fold_put(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, cand, child, i, p), fold_scannext(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, i, p, cand)
+  fold_scannext(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, i: i64, p: i64, cand: i64):
+    %c1 = add i64 cand, 1
+    br fold_scan(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, i, p, %c1)
+  fold_put(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, cand: i64, child: ptr, i: i64, p: i64):
+    %ge = icmp.sge i64 cand, 16
+    condbr %ge, bug(), fold_put2(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, cand, child, i, p)
+  fold_put2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, cand: i64, child: ptr, i: i64, p: i64):
+    %off = mul i64 cand, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, p
+    %n1 = add i64 cand, 1
+    %f1 = sub i64 nr_free, 1
+    br fold_cpnext(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, %f1, retained, %n1, child, i)
+  fold_cpnext(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr, i: i64):
+    %i1 = add i64 i, 1
+    br fold_copy(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot, child, %i1)
+  fold_cpdone(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64, child: ptr):
+    call void kfree(child)
+    br fold_next(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot, nr, nr_free, retained, next_slot)
+  fold_next(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64, nr: i64, nr_free: i64, retained: i64, next_slot: i64):
+    %s1 = add i64 slot, 1
+    br fold_loop(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %s1, nr, nr_free, retained, next_slot)
+  fold_done(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, nr: i64, nr_free: i64, retained: i64):
+    %nrp = gep i8 %new_n, 144
+    store i64 %nrp, nr
+    br fold_chk2(array, ops, iter, data, edit, root_slot, node, new_n, nr, nr_free, retained)
+  fold_chk2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr: i64, nr_free: i64, retained: i64):
+    %nz = icmp.ne i64 retained, 0
+    condbr %nz, fold_rchk(array, ops, iter, data, edit, root_slot, node, new_n, nr, nr_free), post(array, ops, iter, data, edit, root_slot, node, new_n, nr, nr_free)
+  fold_rchk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr: i64, nr_free: i64):
+    %le = icmp.ule i64 nr, 16
+    condbr %le, compress(array, ops, iter, data, edit, root_slot, node, new_n, nr), post(array, ops, iter, data, edit, root_slot, node, new_n, nr, nr_free)
+  post(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, nr_free: i64):
+    %eq = icmp.eq i64 nr_free, 15
+    condbr %eq, single(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, 0), post2(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree)
+  single(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64):
+    %off = mul i64 slot, 8
+    %addr = gep i8 %new_n, %off
+    %pp = gep i8 %addr, 16
+    %ptr = load i64, %pp
+    %z = icmp.eq i64 %ptr, 0
+    condbr %z, single_next(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, slot), single_chk(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %ptr)
+  single_next(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, slot: i64):
+    %s1 = add i64 slot, 1
+    br single(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %s1)
+  single_chk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, ptr: i64):
+    %meta = and i64 ptr, 3
+    %eq = icmp.eq i64 %meta, 3
+    condbr %eq, single_sc(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, ptr), post2(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree)
+  single_sc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, ptr: i64):
+    %base = and i64 ptr, -4
+    %ns = call ptr kla_fromval(%base)
+    %bp = load i64, %new_n
+    %sp = gep i8 %new_n, 8
+    %ps = load i8, %sp
+    %slot = zext i64 %ps
+    call void kfree(%new_n)
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, ss_root(%ns, ptr, nr_tree, edit, array), ss_chk(array, ops, iter, data, edit, root_slot, node, %ns, nr_tree, ptr, %bp, %slot)
+  ss_root(ns: ptr, ptr: i64, nr_tree: i64, edit: ptr, array: ptr):
+    store i64 %ns, 0
+    %tp = gep i8 %ns, 8
+    store i32 %tp, 0
+    br gc_complete(array, edit, ptr, nr_tree)
+  ss_chk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, ns: ptr, nr_tree: i64, ptr: i64, bp: i64, slot: i64):
+    %sc = and i64 bp, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, ss_sc(array, ops, iter, data, edit, root_slot, node, ns, nr_tree, ptr, bp, slot), ss_fin(array, ops, iter, data, edit, root_slot, node, ns, nr_tree, ptr, bp, slot)
+  ss_sc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, ns: ptr, nr_tree: i64, ptr: i64, bp: i64, slot: i64):
+    %base = and i64 bp, -4
+    %s = call ptr kla_fromval(%base)
+    %nbp = load i64, %s
+    store i64 %ns, %nbp
+    %sp = gep i8 %s, 8
+    %ps = load i32, %sp
+    %tp = gep i8 %ns, 8
+    store i32 %tp, %ps
+    %slot2 = sext i64 %ps
+    call void kfree(%s)
+    %z = icmp.eq i64 %nbp, 0
+    condbr %z, ss_root(ns, ptr, nr_tree, edit, array), ss_fin(array, ops, iter, data, edit, root_slot, node, ns, nr_tree, ptr, %nbp, %slot2)
+  ss_fin(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, ns: ptr, nr_tree: i64, ptr: i64, bp: i64, slot: i64):
+    store i64 %ns, bp
+    %tp = gep i8 %ns, 8
+    %s32 = trunc i32 slot
+    store i32 %tp, %s32
+    %base = and i64 bp, -4
+    %par = call ptr kla_fromval(%base)
+    %off = mul i64 slot, 8
+    %addr = gep i8 %par, %off
+    %pp = gep i8 %addr, 16
+    store i64 %pp, ptr
+    br ascend_old(array, ops, iter, data, edit, root_slot, node, %par, nr_tree)
+  post2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64):
+    %bp = load i64, %new_n
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, gc_complete_slot(array, edit, root_slot, nr_tree), post2_chk(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %bp)
+  post2_chk(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, bp: i64):
+    %sc = and i64 bp, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, post2_sc(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, bp), post2_node(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, bp)
+  post2_node(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, bp: i64):
+    %base = and i64 bp, -4
+    %par = call ptr kla_fromval(%base)
+    br ascend_old(array, ops, iter, data, edit, root_slot, node, %par, nr_tree)
+  post2_sc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, bp: i64):
+    %base = and i64 bp, -4
+    %s = call ptr kla_fromval(%base)
+    %nbp = load i64, %s
+    %sp = gep i8 %s, 8
+    %ps = load i32, %sp
+    %slot = sext i64 %ps
+    %nrp = gep i8 %new_n, 144
+    %nr = load i64, %nrp
+    %le = icmp.ule i64 %nr, 16
+    condbr %le, post2_exc(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %s, %nbp, %slot), post2_node(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %nbp)
+  post2_exc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, s: ptr, nbp: i64, slot: i64):
+    store i64 %new_n, nbp
+    %tp = gep i8 %new_n, 8
+    %s8 = trunc i8 slot
+    store i8 %tp, %s8
+    call void kfree(%s)
+    %z = icmp.eq i64 %nbp, 0
+    condbr %z, gc_complete_newn(array, edit, new_n, nr_tree), post2_exc2(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, %nbp, %slot)
+  post2_exc2(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, nbp: i64, slot: i64):
+    %base = and i64 %nbp, -4
+    %par = call ptr kla_fromval(%base)
+    %off = mul i64 slot, 8
+    %addr = gep i8 %par, %off
+    %pp = gep i8 %addr, 16
+    %nv = call i64 kla_ptrval(%new_n)
+    %tag = or i64 %nv, 1
+    store i64 %pp, %tag
+    br ascend_old(array, ops, iter, data, edit, root_slot, node, %par, nr_tree)
+  ascend_old(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64):
+    %bp = load i64, node
+    %sc = and i64 bp, 2
+    %nz = icmp.ne i64 %sc, 0
+    condbr %nz, ao_sc(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, bp), ao_node(array, ops, iter, data, edit, root_slot, node, new_n, nr_tree, bp)
+  ao_sc(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, bp: i64):
+    %base = and i64 bp, -4
+    %sc = call ptr kla_fromval(%base)
+    %sp = gep i8 %sc, 8
+    %ps = load i32, %sp
+    %slot = sext i64 %ps
+    %cursor = load i64, %sc
+    %z = icmp.eq i64 %cursor, 0
+    condbr %z, gc_complete_slot(array, edit, root_slot, nr_tree), ao_go(array, ops, iter, data, edit, root_slot, new_n, nr_tree, %cursor, %slot)
+  ao_node(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, node: ptr, new_n: ptr, nr_tree: i64, bp: i64):
+    %sp = gep i8 node, 8
+    %ps = load i8, %sp
+    %slot = zext i64 %ps
+    %z = icmp.eq i64 %bp, 0
+    condbr %z, bug(), ao_go(array, ops, iter, data, edit, root_slot, new_n, nr_tree, bp, %slot)
+  ao_go(array: ptr, ops: ptr, iter: ptr, data: ptr, edit: ptr, root_slot: ptr, new_n: ptr, nr_tree: i64, cursor: i64, slot: i64):
+    %base = and i64 cursor, -4
+    %node2 = call ptr kla_fromval(%base)
+    %s1 = add i64 slot, 1
+    br continue_node(array, ops, iter, data, edit, root_slot, %node2, new_n, %s1, nr_tree)
+  gc_complete_slot(array: ptr, edit: ptr, root_slot: ptr, nr_tree: i64):
+    %root = load i64, %root_slot
+    br gc_complete(array, edit, %root, nr_tree)
+  gc_complete_newn(array: ptr, edit: ptr, new_n: ptr, nr_tree: i64):
+    %nv = call i64 kla_ptrval(%new_n)
+    %tag = or i64 %nv, 1
+    br gc_complete(array, edit, %tag, nr_tree)
+  gc_complete(array: ptr, edit: ptr, new_root: i64, nr_tree: i64):
+    call void kla_edit_st(edit, 264, new_root)
+    call void assoc_array_apply_edit(edit)
+    %np = gep i8 %array, 8
+    store i64 %np, nr_tree
+    ret 0
+  enomem(edit: ptr, root_slot: ptr, ops: ptr):
+    %root = load i64, %root_slot
+    call void kla_destroy_subtree(%root, ops)
+    call void kfree(edit)
+    ret -12
+  enomem0():
+    ret -12
+  retzero():
+    ret 0
+  bug():
+    call void kla_bug()
+    ret 0
+}

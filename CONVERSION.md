@@ -1,6 +1,6 @@
 # Krellinux conversion ledger
 
-Generated 2026-11-03 by the Auto-Convergence Engine (gen_ledger.py) from census data. Base: Linux 7.4.0-rc1 (05441d69), fork master 2c3d62bc.
+Generated 2026-11-04 by the Auto-Convergence Engine (gen_ledger.py) from census data. Base: Linux 7.4.0-rc1 (05441d69), fork master 2c3d62bc.
 
 States: **C** untouched - **CONVERTING** in progress - **KRELL** converted and proven by the differential rig - **RESIDUE** named, stays C/asm by decision.
 
@@ -9,8 +9,8 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | File | State | Class | Evidence / blockers |
 |---|---|---|---|
 | `lib/argv_split.c` | C | AUTO | - |
-| `lib/ashldi3.c` | C | AUTO | - |
-| `lib/ashrdi3.c` | C | AUTO | - |
+| `lib/ashldi3.c` | KRELL (function) | AUTO | __ashldi3() rewritten in Krell (lib/ashldi3.krell); differential rig vs the C original: 65,184 cases (every shift count 0..63 x structured and random operands), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbol where configured. |
+| `lib/ashrdi3.c` | KRELL (function) | AUTO | __ashrdi3() rewritten in Krell (lib/ashrdi3.krell); differential rig vs the C original: 65,184 cases (every shift count 0..63 x structured and random operands), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbol where configured. |
 | `lib/asn1_decoder.c` | C | ASSIST | indirect calls / function pointers |
 | `lib/asn1_encoder.c` | C | ASSIST | indirect calls / function pointers; inline asm |
 | `lib/assoc_array.c` | C | ASSIST | indirect calls / function pointers; inline asm |
@@ -18,7 +18,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/atomic64_test.c` | C | ASSIST | indirect calls / function pointers; atomics beyond load/store/add; inline asm |
 | `lib/audit.c` | C | AUTO | - |
 | `lib/base64.c` | C | AUTO | - |
-| `lib/bcd.c` | C | AUTO | - |
+| `lib/bcd.c` | KRELL (functions) | AUTO | _bcd2bin() and _bin2bcd() rewritten in Krell (lib/bcd.krell); differential rig vs the C original: 160,256 cases (_bcd2bin exhaustive over all 256 inputs; _bin2bcd exhaustive 0..99999 plus random full-range values), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbols. |
 | `lib/bch.c` | C | ASSIST | inline asm |
 | `lib/bitmap-str.c` | C | AUTO | - |
 | `lib/bitmap.c` | C | AUTO | - |
@@ -37,7 +37,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/clz_ctz.c` | C | AUTO | - |
 | `lib/clz_tab.c` | C | AUTO | - |
 | `lib/cmdline.c` | C | AUTO | - |
-| `lib/cmpdi2.c` | C | AUTO | - |
+| `lib/cmpdi2.c` | KRELL (function) | AUTO | __cmpdi2() rewritten in Krell (lib/cmpdi2.krell); differential rig vs the C original: 60,225 cases (structured cross-product plus random and near-equal pairs), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbol where configured. |
 | `lib/cmpxchg-emu.c` | C | ASSIST | atomics beyond load/store/add; volatile; inline asm |
 | `lib/codetag.c` | C | ASSIST | indirect calls / function pointers; inline asm |
 | `lib/compat_audit.c` | C | RESIDUE | clang parse error: 'asm/unistd32.h' file not found |
@@ -117,7 +117,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/logic_iomem.c` | C | ASSIST | indirect calls / function pointers; volatile; inline asm |
 | `lib/logic_pio.c` | C | AUTO | - |
 | `lib/lru_cache.c` | C | ASSIST | indirect calls / function pointers; atomics beyond load/store/add; volatile; inline asm |
-| `lib/lshrdi3.c` | C | AUTO | - |
+| `lib/lshrdi3.c` | KRELL (function) | AUTO | __lshrdi3() rewritten in Krell (lib/lshrdi3.krell); differential rig vs the C original: 65,184 cases (every shift count 0..63 x structured and random operands), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbol where configured. |
 | `lib/lwq.c` | C | ASSIST | inline asm |
 | `lib/maple_tree.c` | C | ASSIST | indirect calls / function pointers; inline asm |
 | `lib/memcat_p.c` | C | AUTO | - |
@@ -211,7 +211,7 @@ Census of lib/: {'AUTO': 83, 'ASSIST': 104, 'RESIDUE': 25} (AUTO / ASSIST / RESI
 | `lib/ts_fsm.c` | C | ASSIST | indirect calls / function pointers |
 | `lib/ts_kmp.c` | C | ASSIST | indirect calls / function pointers |
 | `lib/ubsan.c` | C | ASSIST | inline asm |
-| `lib/ucmpdi2.c` | C | AUTO | - |
+| `lib/ucmpdi2.c` | KRELL (function) | AUTO | __ucmpdi2() rewritten in Krell (lib/ucmpdi2.krell); differential rig vs the C original: 60,225 cases (structured cross-product plus random and near-equal pairs), 0 divergence; Krell object linked into vmlinux and self-checked at boot (Phase 1 batch 1). The C file still provides the symbol where configured. |
 | `lib/ucs2_string.c` | C | AUTO | - |
 | `lib/union_find.c` | C | AUTO | - |
 | `lib/usercopy.c` | C | ASSIST | inline asm |

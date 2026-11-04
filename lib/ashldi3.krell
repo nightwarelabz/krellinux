@@ -1,0 +1,15 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+; Krellinux Phase 1 conversion of lib/ashldi3.c: __ashldi3(long long, int).
+;
+; The C original performs the 64-bit shift through a 32-bit-halves
+; union (a workaround for compilers without native 64-bit shifts).
+; Krell has native i64 shifts with total semantics (shift amount
+; modulo 64), so the Krell form is the shift itself. Over the C
+; function's defined domain (shift counts 0..63, the only values its
+; callers generate) the two agree exactly; the differential rig
+; proves this for every count in the domain.
+fn __ashldi3(i64, i64) -> i64 {
+  entry(u: i64, b: i64):
+    %r = shl i64 u, b
+    ret %r
+}

@@ -350,3 +350,31 @@ CONTEXT_ANALYSIS_test_context-analysis.o := y
 obj-$(CONFIG_CONTEXT_ANALYSIS_TEST) += test_context-analysis.o
 
 subdir-$(CONFIG_FORTIFY_SOURCE) += test_fortify
+
+# Krellinux Phase 1: Krell conversions of lib/ functions, built through
+# krellc and linked beside their C originals with symbols renamed to
+# krell_*; krell_phase1_check.o self-checks them at boot. Each
+# conversion is proven against its C original by the differential rig
+# in tools/converge/rig/ before it is recorded in CONVERSION.md.
+KRELLC ?= krellc
+obj-y += krell_phase1_check.o \
+	 ashldi3_krell.o ashrdi3_krell.o lshrdi3_krell.o \
+	 cmpdi2_krell.o ucmpdi2_krell.o bcd_krell.o
+
+krell_rename = sed -e 's/\b__ashldi3\b/krell___ashldi3/g' \
+	-e 's/\b__ashrdi3\b/krell___ashrdi3/g' \
+	-e 's/\b__lshrdi3\b/krell___lshrdi3/g' \
+	-e 's/\b__cmpdi2\b/krell___cmpdi2/g' \
+	-e 's/\b__ucmpdi2\b/krell___ucmpdi2/g' \
+	-e 's/\b_bcd2bin\b/krell__bcd2bin/g' \
+	-e 's/\b_bin2bcd\b/krell__bin2bcd/g'
+
+$(obj)/%_krell.krel: $(src)/%.krell FORCE
+	$(Q)$(KRELLC) parse $< -o $@
+
+$(obj)/%_krell.s: $(obj)/%_krell.krel FORCE
+	$(Q)$(KRELLC) build $< --target x86_64 -o $@.tmp && \
+	$(krell_rename) $@.tmp > $@ && rm $@.tmp
+
+$(obj)/%_krell.o: $(obj)/%_krell.s FORCE
+	$(Q)$(CC) -c -o $@ $<

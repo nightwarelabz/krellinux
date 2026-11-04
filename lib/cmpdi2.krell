@@ -1,0 +1,16 @@
+; SPDX-License-Identifier: GPL-2.0-or-later
+; Krellinux Phase 1 conversion of lib/cmpdi2.c: __cmpdi2(long long, long long).
+;
+; The C original compares the signed high halves, then the unsigned
+; low halves, returning 0 (less), 1 (equal), or 2 (greater). On a
+; native i64 that is exactly a signed three-way compare; the Krell
+; form states it directly. Proven equal by the differential rig
+; over structured and random operand pairs.
+fn __cmpdi2(i64, i64) -> i64 {
+  entry(a: i64, b: i64):
+    %lt = icmp.slt i64 a, b
+    %gt = icmp.sgt i64 a, b
+    %t = select i64 %gt, 2, 1
+    %r = select i64 %lt, 0, %t
+    ret %r
+}

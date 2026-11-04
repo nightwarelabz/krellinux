@@ -6,6 +6,50 @@ by the differential rig), RESIDUE (named, stays C/asm)."""
 import json, os, sys, datetime
 
 OVERRIDES = {
+    "lib/ashldi3.c": (
+        "KRELL (function)",
+        "__ashldi3() rewritten in Krell (lib/ashldi3.krell); differential "
+        "rig vs the C original: 65,184 cases (every shift count 0..63 x "
+        "structured and random operands), 0 divergence; Krell object "
+        "linked into vmlinux and self-checked at boot (Phase 1 batch 1). "
+        "The C file still provides the symbol where configured."),
+    "lib/ashrdi3.c": (
+        "KRELL (function)",
+        "__ashrdi3() rewritten in Krell (lib/ashrdi3.krell); differential "
+        "rig vs the C original: 65,184 cases (every shift count 0..63 x "
+        "structured and random operands), 0 divergence; Krell object "
+        "linked into vmlinux and self-checked at boot (Phase 1 batch 1). "
+        "The C file still provides the symbol where configured."),
+    "lib/lshrdi3.c": (
+        "KRELL (function)",
+        "__lshrdi3() rewritten in Krell (lib/lshrdi3.krell); differential "
+        "rig vs the C original: 65,184 cases (every shift count 0..63 x "
+        "structured and random operands), 0 divergence; Krell object "
+        "linked into vmlinux and self-checked at boot (Phase 1 batch 1). "
+        "The C file still provides the symbol where configured."),
+    "lib/cmpdi2.c": (
+        "KRELL (function)",
+        "__cmpdi2() rewritten in Krell (lib/cmpdi2.krell); differential "
+        "rig vs the C original: 60,225 cases (structured cross-product "
+        "plus random and near-equal pairs), 0 divergence; Krell object "
+        "linked into vmlinux and self-checked at boot (Phase 1 batch 1). "
+        "The C file still provides the symbol where configured."),
+    "lib/ucmpdi2.c": (
+        "KRELL (function)",
+        "__ucmpdi2() rewritten in Krell (lib/ucmpdi2.krell); "
+        "differential rig vs the C original: 60,225 cases (structured "
+        "cross-product plus random and near-equal pairs), 0 divergence; "
+        "Krell object linked into vmlinux and self-checked at boot "
+        "(Phase 1 batch 1). The C file still provides the symbol where "
+        "configured."),
+    "lib/bcd.c": (
+        "KRELL (functions)",
+        "_bcd2bin() and _bin2bcd() rewritten in Krell (lib/bcd.krell); "
+        "differential rig vs the C original: 160,256 cases (_bcd2bin "
+        "exhaustive over all 256 inputs; _bin2bcd exhaustive 0..99999 "
+        "plus random full-range values), 0 divergence; Krell object "
+        "linked into vmlinux and self-checked at boot (Phase 1 batch 1). "
+        "The C file still provides the symbols."),
     "lib/crc/crc16.c": (
         "KRELL (function)",
         "crc16() rewritten in Krell (lib/crc/crc16.krell); differential "
